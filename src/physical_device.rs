@@ -56,7 +56,6 @@ impl PhysicalDeviceContext {
             supported_optionals,
         }
     }
-
 }
 
 unsafe fn query_queue_families(

@@ -39,7 +39,11 @@ impl SubmissionSpan {
     /// retrieved.
     pub fn completion_times_ns(&self, clock: &DeviceClock) -> Option<(u64, u64)> {
         let start = self.head.await_start_ns(clock)?;
-        let end = self.tail.as_ref().unwrap_or(&self.head).await_end_ns(clock)?;
+        let end = self
+            .tail
+            .as_ref()
+            .unwrap_or(&self.head)
+            .await_end_ns(clock)?;
         Some((start, end))
     }
 
@@ -87,4 +91,3 @@ impl SubmissionSpan {
         }
     }
 }
-

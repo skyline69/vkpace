@@ -114,12 +114,21 @@ fn run(inner: Arc<Inner>) {
     loop {
         while let Some(item) = inner.queue.pop() {
             let now_before = DeviceClock::now();
-            let r = unsafe { wait(inner.device, item.swapchain, item.present_id, WAIT_TIMEOUT_NS) };
+            let r = unsafe {
+                wait(
+                    inner.device,
+                    item.swapchain,
+                    item.present_id,
+                    WAIT_TIMEOUT_NS,
+                )
+            };
             let now_after = DeviceClock::now();
             match r {
                 vk::Result::SUCCESS => {
                     // Record on the markers history. host_ns → microseconds.
-                    inner.markers.record_present_actual(item.present_id, now_after);
+                    inner
+                        .markers
+                        .record_present_actual(item.present_id, now_after);
                     tracing::trace!(
                         present_id = item.present_id,
                         wait_us = (now_after - now_before) / 1_000,
