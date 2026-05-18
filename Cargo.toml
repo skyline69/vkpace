@@ -1,0 +1,63 @@
+[package]
+name = "vkpace"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Ö. Efe D. <67526259+skyline69@users.noreply.github.com>"]
+description = "vkpace — Vulkan implicit layer that reduces input latency by spoofing AMD Anti-Lag or NVIDIA Reflex on any compliant driver."
+
+[lib]
+name = "VkLayer_VKPACE_reduce_latency"
+crate-type = ["cdylib"]
+
+[dependencies]
+ash = { version = "0.38", default-features = false }
+dashmap = "6"
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+once_cell = "1"
+libc = "0.2"
+smallvec = "1"
+rustc-hash = "2"
+crossbeam-queue = "0.3"
+
+[dev-dependencies]
+rustc-hash = "2"
+
+# Hot game-loop entrypoints: maximize for runtime perf, accept long compile.
+[profile.release]
+opt-level = 3
+# Full cross-crate LTO: lets the optimizer inline `ash` vk wrappers + our
+# dispatch indirections into the FFI entrypoints. Compile ≈ 30 s.
+lto = "fat"
+codegen-units = 1
+# No debuginfo in production .so — saves ~5 MB, slightly faster page-in.
+debug = 0
+# Strip everything except the exported FFI symbols. Loader only needs
+# `VkPace_GetInstanceProcAddr`, `VkPace_GetDeviceProcAddr`, and
+# `vkNegotiateLoaderLayerInterfaceVersion`; rest is internal.
+strip = "symbols"
+panic = "abort"
+incremental = false
+overflow-checks = false
+
+# Dependencies recompile at the same level — important for LTO across
+# `ash`/`dashmap`/`parking_lot`/etc.
+[profile.release.package."*"]
+opt-level = 3
+codegen-units = 1
+
+# Build scripts: keep fast.
+[profile.release.build-override]
+opt-level = 0
+codegen-units = 16
+
+# Portable variant: same as `release` but without `target-cpu` overrides
+# (set via `.cargo/config.toml`). Useful for shipping a binary that works
+# on any x86-64 box. Invoke with `cargo build --profile release-portable`.
+[profile.release-portable]
+inherits = "release"
+
+[profile.dev]
+opt-level = 1

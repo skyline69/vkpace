@@ -1,0 +1,19 @@
+{
+    "file_format_version": "1.0.0",
+    "layer": {
+        "name": "VK_LAYER_VKPACE_reduce_latency",
+        "type": "GLOBAL",
+        "library_path": "@LIB_PATH@",
+        "api_version": "1.3.0",
+        "implementation_version": "1",
+        "description": "vkpace — input latency reduction layer",
+        "functions": {
+            "vkGetInstanceProcAddr": "VkPace_GetInstanceProcAddr",
+            "vkGetDeviceProcAddr": "VkPace_GetDeviceProcAddr",
+            "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+        },
+        "disable_environment": {
+            "DISABLE_VKPACE": "1"
+        }
+    }
+}

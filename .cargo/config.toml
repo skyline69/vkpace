@@ -1,0 +1,28 @@
+# Build tuning for vkpace.
+#
+# - `target-cpu=native` lets LLVM emit AVX2 / BMI2 / etc. for the current
+#   host. The layer is normally built on the same machine it runs on, so
+#   this is a free perf win. Cross-distribute builds should override with
+#   `RUSTFLAGS="-C target-cpu=x86-64-v3"` or compile with the
+#   `release-portable` profile (which still benefits from LTO + strip).
+# - `mold` is dramatically faster than the system `ld` and is required to
+#   make full-LTO release rebuilds tolerable. Falls back gracefully if
+#   `mold` is absent (the rustflag is still valid).
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "link-arg=-fuse-ld=mold",
+    "-C", "link-arg=-Wl,--icf=safe",
+]
+
+[target.aarch64-unknown-linux-gnu]
+linker = "clang"
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "link-arg=-fuse-ld=mold",
+]
+
+[build]
+# No global rustflags override here — keep per-target so cross-builds work.
