@@ -46,6 +46,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Integration test dlopen's the built cdylib via CARGO_MANIFEST_DIR;
+      # build it first so the path resolution short-circuits without
+      # re-invoking cargo from inside the test.
+      - run: cargo build --lib
       - run: cargo test --all-features
 
   miri:

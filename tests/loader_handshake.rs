@@ -37,24 +37,61 @@ struct NegotiateLayerInterface {
 }
 
 fn open_layer() -> *mut c_void {
-    let candidates = [
-        "../target/release/libVkLayer_VKPACE_reduce_latency.so",
-        "../target/debug/libVkLayer_VKPACE_reduce_latency.so",
-        "./target/release/libVkLayer_VKPACE_reduce_latency.so",
-        "./target/debug/libVkLayer_VKPACE_reduce_latency.so",
-    ];
-    for path in candidates {
-        if let Ok(c) = CString::new(path) {
+    const LIB: &str = "libVkLayer_VKPACE_reduce_latency.so";
+    const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
+    let manifest = std::path::Path::new(MANIFEST_DIR);
+
+    // Search paths in priority order. We include `deps/` because some Cargo
+    // versions place the cdylib there for test runs, plus the standard
+    // top-level locations a regular `cargo build` produces.
+    let candidates: Vec<std::path::PathBuf> = ["release", "debug"]
+        .iter()
+        .flat_map(|profile| {
+            [
+                manifest.join("target").join(profile).join(LIB),
+                manifest.join("target").join(profile).join("deps").join(LIB),
+            ]
+        })
+        .chain(std::iter::once(std::path::PathBuf::from(LIB)))
+        .collect();
+
+    let mut tried = Vec::new();
+    for path in &candidates {
+        let Some(s) = path.to_str() else { continue };
+        if !path.exists() {
+            tried.push(s.to_string());
+            continue;
+        }
+        if let Ok(c) = CString::new(s) {
+            let h = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+            if !h.is_null() {
+                return h;
+            }
+            tried.push(format!("{s} (dlopen failed)"));
+        }
+    }
+
+    // Last-chance: if no prebuilt cdylib exists yet, build it ourselves.
+    // CI hits this when `cargo test` is the entry point.
+    let status = std::process::Command::new(env!("CARGO"))
+        .args(["build", "--lib"])
+        .current_dir(MANIFEST_DIR)
+        .status();
+    if let Ok(s) = status
+        && s.success()
+    {
+        let p = manifest.join("target").join("debug").join(LIB);
+        if let Some(ps) = p.to_str()
+            && let Ok(c) = CString::new(ps)
+        {
             let h = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
             if !h.is_null() {
                 return h;
             }
         }
     }
-    panic!(
-        "could not load built libVkLayer_VKPACE_reduce_latency.so — \
-         run `cargo build` first"
-    );
+
+    panic!("could not load libVkLayer_VKPACE_reduce_latency.so; tried: {tried:?}");
 }
 
 unsafe fn dlsym<F>(handle: *mut c_void, name: &CStr) -> Option<F> {
