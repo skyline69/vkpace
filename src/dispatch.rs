@@ -152,6 +152,7 @@ pub struct DeviceTable {
     pub acquire_next_image2_khr: Option<vk::PFN_vkAcquireNextImage2KHR>,
     pub signal_semaphore: Option<vk::PFN_vkSignalSemaphore>,
     pub get_semaphore_counter_value: Option<vk::PFN_vkGetSemaphoreCounterValue>,
+    pub wait_for_present_khr: Option<vk::PFN_vkWaitForPresentKHR>,
 }
 
 impl DeviceTable {
@@ -212,6 +213,7 @@ impl DeviceTable {
                     .or_else(|| load_dev(gdpa, device, c"vkSignalSemaphoreKHR")),
                 get_semaphore_counter_value: load_dev(gdpa, device, c"vkGetSemaphoreCounterValue")
                     .or_else(|| load_dev(gdpa, device, c"vkGetSemaphoreCounterValueKHR")),
+                wait_for_present_khr: load_dev(gdpa, device, c"vkWaitForPresentKHR"),
             }
         }
     }

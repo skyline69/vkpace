@@ -10,11 +10,21 @@ pub const REQUIRED_EXTENSIONS: &[&CStr] = &[
     vk::EXT_HOST_QUERY_RESET_NAME,
 ];
 
+/// Extensions we'd like to have but won't refuse the layer over. Enabled
+/// during `vkCreateDevice` only when the physical device advertises them.
+/// Present-wait/present-id unlock the real display-side completion-time
+/// path on Linux.
+pub const OPTIONAL_EXTENSIONS: &[&CStr] = &[vk::KHR_PRESENT_ID_NAME, vk::KHR_PRESENT_WAIT_NAME];
+
 pub struct PhysicalDeviceContext {
     pub instance: Arc<InstanceContext>,
     pub properties: vk::PhysicalDeviceProperties,
     pub queue_family_properties: Vec<vk::QueueFamilyProperties>,
     pub supports_required_extensions: bool,
+    /// Subset of [`OPTIONAL_EXTENSIONS`] this device exposes. Indices align
+    /// with the slice above. Caller may iterate to know what to enable +
+    /// feature-patch at device creation time.
+    pub supported_optionals: Vec<&'static CStr>,
 }
 
 impl PhysicalDeviceContext {
@@ -26,15 +36,27 @@ impl PhysicalDeviceContext {
         unsafe { (fns.get_physical_device_properties)(handle, &mut properties) };
 
         let queue_family_properties = unsafe { query_queue_families(&instance, handle) };
-        let supports_required_extensions = unsafe { check_required_extensions(&instance, handle) };
+        let available = unsafe { list_available_extensions(&instance, handle) };
+
+        let supports_required_extensions = REQUIRED_EXTENSIONS
+            .iter()
+            .all(|w| available.iter().any(|h| h == w.to_bytes()));
+
+        let supported_optionals: Vec<&'static CStr> = OPTIONAL_EXTENSIONS
+            .iter()
+            .copied()
+            .filter(|w| available.iter().any(|h| h == w.to_bytes()))
+            .collect();
 
         Self {
             instance,
             properties,
             queue_family_properties,
             supports_required_extensions,
+            supported_optionals,
         }
     }
+
 }
 
 unsafe fn query_queue_families(
@@ -62,10 +84,12 @@ unsafe fn query_queue_families(
     props
 }
 
-unsafe fn check_required_extensions(
+/// All device extensions the driver advertises for `physical_device`, each
+/// returned as its raw byte-name (no NUL terminator).
+unsafe fn list_available_extensions(
     instance: &InstanceContext,
     physical_device: vk::PhysicalDevice,
-) -> bool {
+) -> Vec<Vec<u8>> {
     let fns = &instance.fns;
     let mut count = 0u32;
     let r = unsafe {
@@ -77,7 +101,7 @@ unsafe fn check_required_extensions(
         )
     };
     if r != vk::Result::SUCCESS {
-        return false;
+        return Vec::new();
     }
     let mut props = vec![vk::ExtensionProperties::default(); count as usize];
     let r = unsafe {
@@ -89,15 +113,13 @@ unsafe fn check_required_extensions(
         )
     };
     if r != vk::Result::SUCCESS {
-        return false;
+        return Vec::new();
     }
     props.truncate(count as usize);
-
-    REQUIRED_EXTENSIONS.iter().all(|wanted| {
-        props
-            .iter()
-            .any(|have| ext_name(have) == Some(wanted.to_bytes()))
-    })
+    props
+        .iter()
+        .filter_map(|p| ext_name(p).map(<[u8]>::to_vec))
+        .collect()
 }
 
 fn ext_name(prop: &vk::ExtensionProperties) -> Option<&[u8]> {

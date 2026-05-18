@@ -12,6 +12,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod markers;
 mod semaphore_signal;
 mod swapchain_monitor;
 
@@ -21,6 +22,7 @@ use crate::strategy::{DeviceStrategy, QueueStrategy};
 use crate::submission_span::SubmissionSpan;
 use crate::timestamp_pool::Handle;
 
+pub use markers::MarkerHistory;
 pub use semaphore_signal::SemaphoreSignal;
 pub use swapchain_monitor::SwapchainMonitor;
 
@@ -29,6 +31,7 @@ const MAX_TRACKED_PRESENTS: usize = 50;
 pub struct LowLatency2DeviceStrategy {
     device: Arc<DeviceContext>,
     monitors: RwLock<HashMap<vk::SwapchainKHR, Arc<SwapchainMonitor>>>,
+    markers: Arc<MarkerHistory>,
 }
 
 impl LowLatency2DeviceStrategy {
@@ -36,7 +39,19 @@ impl LowLatency2DeviceStrategy {
         Self {
             device,
             monitors: RwLock::new(HashMap::new()),
+            markers: Arc::new(MarkerHistory::new()),
         }
+    }
+
+    #[inline]
+    pub fn markers(&self) -> &MarkerHistory {
+        &self.markers
+    }
+
+    /// Shareable handle for cross-thread consumers (present-wait worker).
+    #[inline]
+    pub fn markers_arc(&self) -> Arc<MarkerHistory> {
+        self.markers.clone()
     }
 
     pub fn submit_swapchain_present_id(&self, swapchain: vk::SwapchainKHR, present_id: u64) {
@@ -55,7 +70,7 @@ impl LowLatency2DeviceStrategy {
         }
         let monitors = self.monitors.read();
         if let Some(m) = monitors.get(&swapchain) {
-            m.attach_work(work);
+            m.attach_work(present_id, work);
         }
     }
 
@@ -113,7 +128,10 @@ impl DeviceStrategy for LowLatency2DeviceStrategy {
             requested = unsafe { (*p).latency_mode_enable != vk::FALSE };
         }
 
-        let monitor = Arc::new(SwapchainMonitor::new(self.device.clone()));
+        let monitor = Arc::new(SwapchainMonitor::new(
+            self.device.clone(),
+            self.markers.clone(),
+        ));
         monitor.update_params(requested, 0);
         self.monitors.write().insert(swapchain, monitor);
     }

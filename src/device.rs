@@ -6,6 +6,7 @@ use crate::clock::DeviceClock;
 use crate::dispatch::DeviceTable;
 use crate::instance::InstanceContext;
 use crate::physical_device::PhysicalDeviceContext;
+use crate::present_wait::PresentWaitWorker;
 use crate::queue::QueueContext;
 use crate::registry::FxDashMap;
 use crate::strategy::DeviceStrategy;
@@ -24,6 +25,10 @@ pub struct DeviceContext {
     pub clock: Option<Arc<DeviceClock>>,
     pub strategy: OnceLock<Arc<dyn DeviceStrategy>>,
     pub queues: FxDashMap<u64, Arc<QueueContext>>,
+    /// Optional `vkWaitForPresentKHR` worker. Populated when the device
+    /// exposes `VK_KHR_present_wait` *and* the active strategy is LL2
+    /// (Reflex) — only LL2 supplies the `present_id`s we need.
+    pub present_wait: OnceLock<PresentWaitWorker>,
 }
 
 impl DeviceContext {
@@ -55,14 +60,26 @@ impl DeviceContext {
             clock,
             strategy: OnceLock::new(),
             queues: FxDashMap::with_hasher(FxBuildHasher),
+            present_wait: OnceLock::new(),
         });
 
         if layer_enabled {
             let strategy = crate::strategy::make_device_strategy(&ctx);
             ctx.strategy
-                .set(strategy)
+                .set(strategy.clone())
                 .ok()
                 .expect("DeviceContext::strategy set twice");
+
+            // Spin up the present-wait worker, but only when LL2 is the
+            // active strategy and the device exposes vkWaitForPresentKHR.
+            // Other paths (AntiLag) don't currently surface present_ids in
+            // a form we can correlate with marker history.
+            if let Some(ll2) = strategy.as_low_latency2()
+                && let Some(worker) =
+                    PresentWaitWorker::new(ctx.handle, ctx.fns.clone(), ll2.markers_arc())
+            {
+                let _ = ctx.present_wait.set(worker);
+            }
         }
 
         ctx

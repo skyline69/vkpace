@@ -159,6 +159,12 @@ impl Handle {
         self.end_cb
     }
 
+    pub fn await_start_ns(&self, clock: &DeviceClock) -> Option<u64> {
+        self.pool
+            .await_ticks(self.chunk_idx, self.query_index)
+            .map(|t| clock.ticks_to_host_ns(t))
+    }
+
     pub fn await_end_ns(&self, clock: &DeviceClock) -> Option<u64> {
         self.pool
             .await_ticks(self.chunk_idx, self.query_index + 1)

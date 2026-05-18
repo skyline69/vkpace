@@ -25,6 +25,7 @@ mod dispatch;
 mod instance;
 mod physical_device;
 mod pnext;
+mod present_wait;
 mod queue;
 mod registry;
 mod strategy;
@@ -328,10 +329,25 @@ unsafe extern "system" fn create_device(
         // and feature-struct mutations when our layer is enabled.
         let mut extra_ext_storage: Vec<*const c_char> =
             enabled_exts.iter().map(|c| c.as_ptr()).collect();
+        let mut enable_present_id = false;
+        let mut enable_present_wait = false;
         if layer_enabled {
             for &req in REQUIRED_EXTENSIONS {
                 if !enabled_exts.contains(&req) {
                     extra_ext_storage.push(req.as_ptr());
+                }
+            }
+            // Opportunistic: enable present_id/present_wait when supported.
+            // Unlocks real display-side completion time in the marker history.
+            for opt in pd_ctx.supported_optionals.iter().copied() {
+                if !enabled_exts.contains(&opt) {
+                    extra_ext_storage.push(opt.as_ptr());
+                }
+                if opt == vk::KHR_PRESENT_ID_NAME {
+                    enable_present_id = true;
+                }
+                if opt == vk::KHR_PRESENT_WAIT_NAME {
+                    enable_present_wait = true;
                 }
             }
         }
@@ -345,6 +361,8 @@ unsafe extern "system" fn create_device(
         let api_caps = ApiCaps {
             v_1_2: pd_ctx.instance.supports_1_2(),
             v_1_3: pd_ctx.instance.supports_1_3(),
+            enable_present_id,
+            enable_present_wait,
         };
         let mut p_next_head: *const c_void = create_info.p_next;
         if layer_enabled {
@@ -759,6 +777,30 @@ unsafe extern "system" fn queue_present_khr(
             qctx.strategy.notify_present(info);
             if let Some(s) = qctx.device.strategy.get().and_then(|s| s.as_low_latency2()) {
                 strategy::low_latency2::forward_present(s, info);
+            }
+            // Enqueue a vkWaitForPresentKHR per (swapchain, present_id) if
+            // the device has a worker. This is the path that records actual
+            // display-side completion time into the marker history.
+            if let Some(worker) = qctx.device.present_wait.get() {
+                let present_ids = unsafe {
+                    pnext::find::<vk::PresentIdKHR>(info.p_next, vk::StructureType::PRESENT_ID_KHR)
+                        .and_then(|p| {
+                            let p = &*p;
+                            (!p.p_present_ids.is_null()).then(|| {
+                                std::slice::from_raw_parts(
+                                    p.p_present_ids,
+                                    p.swapchain_count as usize,
+                                )
+                            })
+                        })
+                };
+                for i in 0..info.swapchain_count as usize {
+                    let swapchain = unsafe { *info.p_swapchains.add(i) };
+                    let pid = present_ids.map(|s| s[i]).unwrap_or(0);
+                    if pid != 0 {
+                        worker.enqueue(swapchain, pid);
+                    }
+                }
             }
         }
         r
@@ -1178,21 +1220,50 @@ unsafe extern "system" fn set_latency_sleep_mode_nv(
 }
 
 unsafe extern "system" fn set_latency_marker_nv(
-    _device: vk::Device,
+    device: vk::Device,
     _swapchain: vk::SwapchainKHR,
-    _info: *const vk::SetLatencyMarkerInfoNV<'_>,
+    info: *const vk::SetLatencyMarkerInfoNV<'_>,
 ) {
-    crate::catch::vk_void(|| {})
+    crate::catch::vk_void(|| {
+        let Some(ctx) = registry::DEVICES
+            .get(&registry::key(device))
+            .map(|r| r.clone())
+        else {
+            return;
+        };
+        let Some(info) = (unsafe { info.as_ref() }) else {
+            return;
+        };
+        let Some(strategy) = ctx.strategy.get().and_then(|s| s.as_low_latency2()) else {
+            return;
+        };
+        strategy.markers().record(info.present_id, info.marker);
+    })
 }
 
 unsafe extern "system" fn get_latency_timings_nv(
-    _device: vk::Device,
+    device: vk::Device,
     _swapchain: vk::SwapchainKHR,
     timings: *mut vk::GetLatencyMarkerInfoNV<'_>,
 ) {
     crate::catch::vk_void(|| {
-        if !timings.is_null() {
+        if timings.is_null() {
+            return;
+        }
+        let Some(ctx) = registry::DEVICES
+            .get(&registry::key(device))
+            .map(|r| r.clone())
+        else {
             unsafe { (*timings).timing_count = 0 };
+            return;
+        };
+        match ctx.strategy.get().and_then(|s| s.as_low_latency2()) {
+            Some(strategy) => unsafe {
+                strategy.markers().fill(&mut *timings);
+            },
+            None => unsafe {
+                (*timings).timing_count = 0;
+            },
         }
     })
 }
@@ -1295,16 +1366,33 @@ struct AppendHqr {
     host_query_reset: vk::Bool32,
 }
 
+#[repr(C)]
+struct AppendPresentId {
+    s_type: vk::StructureType,
+    p_next: *const c_void,
+    present_id: vk::Bool32,
+}
+
+#[repr(C)]
+struct AppendPresentWait {
+    s_type: vk::StructureType,
+    p_next: *const c_void,
+    present_wait: vk::Bool32,
+}
+
 #[derive(Default)]
 struct FeatureAppends {
     sync2: Option<Box<AppendSync2>>,
     hqr: Option<Box<AppendHqr>>,
+    present_id: Option<Box<AppendPresentId>>,
+    present_wait: Option<Box<AppendPresentWait>>,
 }
 
 impl FeatureAppends {
     /// Link allocated structs into the chain, returning the new head.
-    /// Ordering: hqr → sync2 → previous head. Caller must keep `self` alive
-    /// until the downstream `vkCreateDevice` returns.
+    /// Caller must keep `self` alive until the downstream `vkCreateDevice`
+    /// returns. Order is arbitrary — `pNext` is a set, not a sequence —
+    /// but stable for diff readability.
     unsafe fn relink_into(&mut self, mut head: *const c_void) -> *const c_void {
         if let Some(b) = self.sync2.as_mut() {
             b.p_next = head;
@@ -1314,6 +1402,14 @@ impl FeatureAppends {
             b.p_next = head;
             head = b.as_ref() as *const AppendHqr as *const c_void;
         }
+        if let Some(b) = self.present_id.as_mut() {
+            b.p_next = head;
+            head = b.as_ref() as *const AppendPresentId as *const c_void;
+        }
+        if let Some(b) = self.present_wait.as_mut() {
+            b.p_next = head;
+            head = b.as_ref() as *const AppendPresentWait as *const c_void;
+        }
         head
     }
 }
@@ -1322,6 +1418,8 @@ impl FeatureAppends {
 struct ApiCaps {
     v_1_2: bool,
     v_1_3: bool,
+    enable_present_id: bool,
+    enable_present_wait: bool,
 }
 
 unsafe fn patch_features(p_next_head: *mut c_void, appends: &mut FeatureAppends, caps: ApiCaps) {
@@ -1390,6 +1488,46 @@ unsafe fn patch_features(p_next_head: *mut c_void, appends: &mut FeatureAppends,
             p_next: std::ptr::null(),
             host_query_reset: vk::TRUE,
         }));
+    }
+
+    // VK_KHR_present_id: enable when the physical device supports it AND
+    // the caller didn't pre-supply a features struct. Same prefer-existing
+    // pattern; flip flag in-place if already present.
+    if caps.enable_present_id {
+        if let Some(p) = unsafe {
+            pnext::find_mut::<vk::PhysicalDevicePresentIdFeaturesKHR<'_>>(
+                p_next_head,
+                vk::StructureType::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+            )
+        } {
+            unsafe { (*p).present_id = vk::TRUE };
+        } else {
+            tracing::debug!("appending VkPhysicalDevicePresentIdFeaturesKHR to pNext");
+            appends.present_id = Some(Box::new(AppendPresentId {
+                s_type: vk::StructureType::PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+                p_next: std::ptr::null(),
+                present_id: vk::TRUE,
+            }));
+        }
+    }
+
+    // VK_KHR_present_wait: same shape.
+    if caps.enable_present_wait {
+        if let Some(p) = unsafe {
+            pnext::find_mut::<vk::PhysicalDevicePresentWaitFeaturesKHR<'_>>(
+                p_next_head,
+                vk::StructureType::PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+            )
+        } {
+            unsafe { (*p).present_wait = vk::TRUE };
+        } else {
+            tracing::debug!("appending VkPhysicalDevicePresentWaitFeaturesKHR to pNext");
+            appends.present_wait = Some(Box::new(AppendPresentWait {
+                s_type: vk::StructureType::PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+                p_next: std::ptr::null(),
+                present_wait: vk::TRUE,
+            }));
+        }
     }
 }
 

@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use crate::delay_controller::DelayController;
 use crate::device::DeviceContext;
+use crate::strategy::low_latency2::markers::MarkerHistory;
 use crate::strategy::low_latency2::semaphore_signal::SemaphoreSignal;
-use crate::submission_span::{self, SubmissionSpan};
+use crate::submission_span::SubmissionSpan;
 
 /// Default wait budget for accumulated `SubmissionSpan`s before we signal
 /// the Reflex sleep semaphore anyway. Half a frame at 120 Hz. Bounded so
@@ -20,13 +21,22 @@ use crate::submission_span::{self, SubmissionSpan};
 /// stalls the game-side `vkLatencySleepNV` wait.
 const DEFAULT_WAIT_BUDGET_US: u64 = 4_000;
 
+/// Submission spans tagged with the `present_id` they belong to. Multiple
+/// `attach_work` calls between two `notify_semaphore` calls accumulate
+/// here, each carrying its own present_id.
+struct TaggedSpans {
+    present_id: u64,
+    spans: Vec<SubmissionSpan>,
+}
+
 struct PendingSignal {
     signal: SemaphoreSignal,
-    spans: Vec<SubmissionSpan>,
+    groups: Vec<TaggedSpans>,
 }
 
 struct Shared {
     device: Arc<DeviceContext>,
+    markers: Arc<MarkerHistory>,
     state: Mutex<State>,
     cv: Condvar,
     stop: AtomicBool,
@@ -34,7 +44,7 @@ struct Shared {
 
 struct State {
     pending_signals: VecDeque<PendingSignal>,
-    pending_spans: Vec<SubmissionSpan>,
+    pending_groups: Vec<TaggedSpans>,
     present_delay_ns: u64,
     requested: bool,
     delay_controller: DelayController,
@@ -46,13 +56,14 @@ pub struct SwapchainMonitor {
 }
 
 impl SwapchainMonitor {
-    pub fn new(device: Arc<DeviceContext>) -> Self {
+    pub fn new(device: Arc<DeviceContext>, markers: Arc<MarkerHistory>) -> Self {
         let decoupled = device.instance.is_simulation_decoupled;
         let shared = Arc::new(Shared {
             device,
+            markers,
             state: Mutex::new(State {
                 pending_signals: VecDeque::new(),
-                pending_spans: Vec::new(),
+                pending_groups: Vec::new(),
                 present_delay_ns: 0,
                 requested: false,
                 delay_controller: DelayController::new(decoupled),
@@ -85,19 +96,19 @@ impl SwapchainMonitor {
             signal.signal(&self.shared.device);
             return;
         }
-        let spans = std::mem::take(&mut st.pending_spans);
+        let groups = std::mem::take(&mut st.pending_groups);
         st.pending_signals
-            .push_back(PendingSignal { signal, spans });
+            .push_back(PendingSignal { signal, groups });
         drop(st);
         self.shared.cv.notify_one();
     }
 
-    pub fn attach_work(&self, spans: Vec<SubmissionSpan>) {
+    pub fn attach_work(&self, present_id: u64, spans: Vec<SubmissionSpan>) {
         let mut st = self.shared.state.lock();
         if !st.requested {
             return;
         }
-        st.pending_spans = spans;
+        st.pending_groups.push(TaggedSpans { present_id, spans });
     }
 }
 
@@ -134,24 +145,52 @@ fn run(shared: Arc<Shared>) {
         let layer_delay = shared.device.instance.config.fps_cap_min_delay_ns();
         let delay_ns = app_delay.max(layer_delay);
 
-        // Bounded wait for the prior frame's GPU work. If a span doesn't
-        // finish in time we signal anyway — the game-side waiter must not
-        // stall longer than this budget regardless of GPU pathology.
+        // Bounded wait across every group. Shared deadline: if the first
+        // group eats the whole budget, later groups time out immediately.
         let budget = wait_budget();
-        let total = pending.spans.len();
-        let done = submission_span::await_all_until(&pending.spans, budget);
-        if done < total {
-            tracing::trace!(
-                completed = done,
-                total,
-                budget_us = budget.as_micros() as u64,
-                "LL2: submission span wait timed out — signalling anyway"
-            );
+        let deadline = crate::clock::DeviceClock::now() + budget.as_nanos() as u64;
+        let clock = shared.device.clock.as_deref();
+
+        for group in &pending.groups {
+            let mut group_done = 0usize;
+            for span in &group.spans {
+                if !span.await_completed_until(deadline) {
+                    break;
+                }
+                group_done += 1;
+                // Pull GPU timestamps and record them on the marker history.
+                // Pick the *widest* span in the group (earliest start, latest
+                // end) for this present_id — overlapping queues all
+                // contribute, but reporting the envelope matches what the
+                // Reflex SDK expects.
+                if let Some(clock) = clock
+                    && let Some((s, e)) = span.completion_times_ns(clock)
+                {
+                    record_widest(&shared.markers, group.present_id, s, e);
+                }
+            }
+            if group_done < group.spans.len() {
+                tracing::trace!(
+                    present_id = group.present_id,
+                    completed = group_done,
+                    total = group.spans.len(),
+                    budget_us = budget.as_micros() as u64,
+                    "LL2: submission span wait timed out — signalling anyway"
+                );
+            }
         }
 
         shared.state.lock().delay_controller.delay(delay_ns);
         pending.signal.signal(&shared.device);
     }
+}
+
+/// Update the marker history for `present_id` to be the envelope of any
+/// previously-recorded times and the new `(start, end)`. Lets multiple
+/// queues each contribute and we end up with the earliest start + latest
+/// end across all of them.
+fn record_widest(markers: &MarkerHistory, present_id: u64, start_ns: u64, end_ns: u64) {
+    markers.record_gpu_timing(present_id, start_ns, end_ns);
 }
 
 fn wait_budget() -> Duration {
