@@ -261,10 +261,18 @@ fn plots(
                 // bin reports `10 fps` which looks like an enormous drop on
                 // the first plotted point.
                 let pts = stats::bin_records(snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
-                    if b.len() < 8 {
+                    // Use the bin's actual width — full BIN_NS for sealed
+                    // bins, partial for the current one — so the rightmost
+                    // bin reads true instantaneous fps instead of looking
+                    // like a frame drop.
+                    // Drop bins with too few samples to be representative,
+                    // except the current bin — there we want present-time
+                    // data even if only one record has arrived in this
+                    // half-bin.
+                    if !b.is_current && b.records.len() < 4 {
                         return f64::NAN;
                     }
-                    b.len() as f64 * 1_000_000_000.0 / BIN_NS as f64
+                    b.records.len() as f64 * 1_000_000_000.0 / b.width_ns as f64
                 });
                 let pts: Vec<[f64; 2]> = pts.into_iter().filter(|p| p[1].is_finite()).collect();
                 Plot::new("fps_plot")
@@ -300,13 +308,16 @@ fn plots(
                     return;
                 }
                 let p50_points = stats::bin_records(snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
-                    bin_percentile(b, 0.50)
+                    bin_percentile(&b.records, 0.50)
                 });
                 let p99_points = stats::bin_records(snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
-                    bin_percentile(b, 0.99)
+                    bin_percentile(&b.records, 0.99)
                 });
                 let max_points = stats::bin_records(snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
-                    b.iter().map(|r| r.latency_us as f64).fold(0.0, f64::max)
+                    b.records
+                        .iter()
+                        .map(|r| r.latency_us as f64)
+                        .fold(0.0, f64::max)
                 });
                 Plot::new("latency_plot")
                     .height(inner.available_height())
@@ -344,17 +355,19 @@ fn plots(
             });
 
             plot_card(ui, "frame-time (ms)", plot_h, |inner| {
-                // Skip partial bins (typically the first one after socket
-                // connect): a bin with only a handful of records at startup
-                // gives `BIN_MS / count` = a hugely inflated frame-time
-                // value that drags the Y axis up and looks like a spike.
-                // Require at least 8 records before we trust the average.
+                // Same trick as fps: use the bin's actual width so the
+                // current bin reads `width_ms / count` instead of the
+                // full BIN_NS denominator.
                 let pts = stats::bin_records(snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
-                    if b.len() < 8 {
+                    // Drop bins with too few samples to be representative,
+                    // except the current bin — there we want present-time
+                    // data even if only one record has arrived in this
+                    // half-bin.
+                    if !b.is_current && b.records.len() < 4 {
                         return f64::NAN;
                     }
-                    let secs_per_bin = BIN_NS as f64 / 1e9;
-                    secs_per_bin * 1000.0 / b.len() as f64
+                    let secs = b.width_ns as f64 / 1e9;
+                    secs * 1000.0 / b.records.len() as f64
                 });
                 let pts: Vec<[f64; 2]> = pts.into_iter().filter(|p| p[1].is_finite()).collect();
                 Plot::new("frametime_plot")
