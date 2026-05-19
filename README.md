@@ -49,6 +49,8 @@ VKPACE_SPOOF_NVIDIA=1             # rewrite PhysicalDeviceProperties to look NVI
 VKPACE_SPOOF_MODEL=RTX_5090       # any preset key from RTX_2060 through RTX_5090
 VKPACE_FORCE_DECOUPLED=1          # assume decoupled sim thread (run drain controller)
 VKPACE_FPS_CAP=144                # hard FPS cap, combined with any app cap
+VKPACE_VRR=1                      # soft FPS target = display refresh - VKPACE_VRR_OFFSET
+VKPACE_VRR_OFFSET=3               # Hz subtracted from refresh for the soft target
 VKPACE_LL2_WAIT_BUDGET_US=4000    # max time we hold the Reflex sleep semaphore
 VKPACE_LOG=info                   # tracing-subscriber env filter
 VKPACE_STATS_INTERVAL=5           # seconds between counter snapshot logs (0 = off)
@@ -77,6 +79,31 @@ Any GPU and driver that support `VK_KHR_synchronization2`,
 `VK_KHR_calibrated_timestamps`, and `VK_EXT_host_query_reset`. That covers
 every RTX 20 series and newer, AMD RDNA1 and newer, Intel Xe, and any
 modern Mesa driver.
+
+## Intel Xe desktops
+
+Intel iGPUs are a common Wayland-desktop case where many games refuse to
+show a Reflex toggle because the driver reports `vendorID = 0x8086`. Set
+`VKPACE_SPOOF_NVIDIA=1` (optionally with `VKPACE_SPOOF_MODEL`) so the app's
+hardware probe sees an NVIDIA GPU and exposes the toggle; the layer still
+runs on the actual Xe device underneath. Per-app TOML overrides apply the
+same way as on AMD.
+
+## Per-app config matching
+
+`pApplicationInfo->pApplicationName` is the primary match key. Native Linux
+apps frequently leave that field null; vkpace falls back to the basename
+of `/proc/self/exe`, so a `[app."my-game"]` stanza still matches when
+launched as `./my-game`. Proton wrappers set the `.exe` filename, so
+`[app."Game-Win64-Shipping.exe"]` continues to work unchanged.
+
+## Present-time source
+
+Frame-end timestamps for the Reflex overlay come from `VK_KHR_present_wait`
+when the driver exposes it (most current Mesa + NVIDIA), and fall back to
+`VK_GOOGLE_display_timing` otherwise. The GOOGLE path is FIFO-ordered, so
+correlation is one present_id off if the app drops a present, but the
+overlay still gets non-zero timings on older Mesa.
 
 ## Inspiration
 

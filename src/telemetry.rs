@@ -4,7 +4,7 @@
 //!
 //! 1. **Counters** — `frames`, `submits`, `presents`, `injections` —
 //!    `AtomicU64`, incremented from hot paths. Lock-free.
-//! 2. **Optional unix socket** — when `LOW_LATENCY_LAYER_TELEMETRY_SOCKET`
+//! 2. **Optional unix socket** — when `VKPACE_TELEMETRY_SOCKET`
 //!    is set, a background thread accepts a single connection at a time and
 //!    streams newline-delimited JSON records (one per present) to the peer.
 //!    Recording is bounded by a small ring buffer; if the consumer can't
@@ -17,11 +17,20 @@ use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
 use std::io::Write;
 use std::os::unix::net::UnixListener;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 
 const RING_CAPACITY: usize = 1024;
+
+/// Anything that can produce a snapshot of recent end-to-end latency
+/// samples (microseconds). Registered with the telemetry stats worker so
+/// it can report p50/p99 click-to-photon per device alongside counters.
+pub trait LatencySource: Send + Sync {
+    /// Append recent samples (in µs) to `out`. Implementations should not
+    /// block — this runs on the stats worker thread.
+    fn latencies_us(&self, out: &mut Vec<u64>);
+}
 
 #[derive(Default)]
 pub struct Counters {
@@ -74,6 +83,7 @@ pub struct Telemetry {
     stats_worker: Mutex<Option<JoinHandle<()>>>,
     stats_stop: Arc<AtomicBool>,
     stats_wake: Arc<(Mutex<()>, Condvar)>,
+    latency_sources: Arc<Mutex<Vec<Weak<dyn LatencySource>>>>,
 }
 
 impl Telemetry {
@@ -102,14 +112,17 @@ impl Telemetry {
         let counters = Arc::new(Counters::default());
         let stats_stop = Arc::new(AtomicBool::new(false));
         let stats_wake = Arc::new((Mutex::new(()), Condvar::new()));
+        let latency_sources: Arc<Mutex<Vec<Weak<dyn LatencySource>>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let stats_worker = if stats_interval_s > 0 {
             let counters = counters.clone();
             let stop = stats_stop.clone();
             let wake = stats_wake.clone();
+            let sources = latency_sources.clone();
             Some(
                 thread::Builder::new()
                     .name("vkpace-stats".into())
-                    .spawn(move || run_stats(counters, stop, wake, stats_interval_s))
+                    .spawn(move || run_stats(counters, stop, wake, sources, stats_interval_s))
                     .expect("spawn stats"),
             )
         } else {
@@ -123,7 +136,14 @@ impl Telemetry {
             stats_worker: Mutex::new(stats_worker),
             stats_stop,
             stats_wake,
+            latency_sources,
         }
+    }
+
+    /// Register a latency source. Held as `Weak` so dropped devices auto-evict
+    /// on the next stats tick — no explicit unregister needed.
+    pub fn register_latency_source(&self, src: Weak<dyn LatencySource>) {
+        self.latency_sources.lock().push(src);
     }
 
     pub fn push_record(&self, rec: FrameRecord) {
@@ -162,10 +182,12 @@ fn run_stats(
     counters: Arc<Counters>,
     stop: Arc<AtomicBool>,
     wake: Arc<(Mutex<()>, Condvar)>,
+    sources: Arc<Mutex<Vec<Weak<dyn LatencySource>>>>,
     interval_s: u64,
 ) {
     let interval = std::time::Duration::from_secs(interval_s);
     let mut last_frames = 0u64;
+    let mut scratch: Vec<u64> = Vec::with_capacity(256);
     while !stop.load(Ordering::Acquire) {
         let mut g = wake.0.lock();
         let _ = wake.1.wait_for(&mut g, interval);
@@ -180,15 +202,58 @@ fn run_stats(
         let frames_delta = frames - last_frames;
         let fps = frames_delta as f64 / interval_s as f64;
         last_frames = frames;
-        tracing::info!(
-            frames,
-            submits,
-            injections,
-            acquires,
-            recent_fps = fps,
-            "telemetry snapshot"
-        );
+
+        // Gather click-to-photon samples from every still-live source.
+        // Evict dropped devices in-place.
+        scratch.clear();
+        {
+            let mut srcs = sources.lock();
+            srcs.retain(|w| {
+                if let Some(src) = w.upgrade() {
+                    src.latencies_us(&mut scratch);
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+        let (p50_us, p99_us) = percentile_p50_p99(&mut scratch);
+        if !scratch.is_empty() {
+            tracing::info!(
+                frames,
+                submits,
+                injections,
+                acquires,
+                recent_fps = fps,
+                latency_samples = scratch.len(),
+                latency_p50_us = p50_us,
+                latency_p99_us = p99_us,
+                "telemetry snapshot"
+            );
+        } else {
+            tracing::info!(
+                frames,
+                submits,
+                injections,
+                acquires,
+                recent_fps = fps,
+                "telemetry snapshot"
+            );
+        }
     }
+}
+
+/// In-place p50/p99. Caller's vec is reused as scratch — sorted on return.
+fn percentile_p50_p99(samples: &mut [u64]) -> (u64, u64) {
+    if samples.is_empty() {
+        return (0, 0);
+    }
+    samples.sort_unstable();
+    let p = |q: f64| -> u64 {
+        let idx = ((samples.len() as f64 - 1.0) * q).round() as usize;
+        samples[idx.min(samples.len() - 1)]
+    };
+    (p(0.50), p(0.99))
 }
 
 fn run_socket(shared: Arc<SocketShared>) {
@@ -252,5 +317,32 @@ fn serve_client(shared: &Arc<SocketShared>, conn: &mut std::os::unix::net::UnixS
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percentiles_on_known_distribution() {
+        // Excel-style rank: idx = round((n-1) * q). For 100 samples that
+        // puts p50 at index 50 (value 51) and p99 at index 98 (value 99).
+        let mut s: Vec<u64> = (1..=100).collect();
+        let (p50, p99) = percentile_p50_p99(&mut s);
+        assert_eq!(p50, 51);
+        assert_eq!(p99, 99);
+    }
+
+    #[test]
+    fn percentiles_empty() {
+        let mut s: Vec<u64> = vec![];
+        assert_eq!(percentile_p50_p99(&mut s), (0, 0));
+    }
+
+    #[test]
+    fn percentiles_single_sample() {
+        let mut s = vec![42u64];
+        assert_eq!(percentile_p50_p99(&mut s), (42, 42));
     }
 }

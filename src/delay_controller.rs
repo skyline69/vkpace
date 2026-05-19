@@ -168,4 +168,38 @@ mod tests {
         // No min_delay = should return quickly (within 5ms even on a busy CI box).
         assert!(after - before < 5_000_000);
     }
+
+    /// Feed the controller a stable 16ms frametime stream under
+    /// decoupled-simulation mode. After many iterations the EWMA gradient
+    /// should settle in [-1, 1] and the drain accumulator should be a
+    /// non-negative fraction of one frame.
+    #[test]
+    fn drain_bounds_under_stable_frametime() {
+        let mut ctl = DelayController::new(true);
+        let target = 16_000_000i64;
+        for _ in 0..400 {
+            step_with_frametime(&mut ctl, target);
+        }
+        assert!(ctl.drain_ns >= 0);
+        assert!(
+            ctl.drain_ns <= target,
+            "drain {} exceeded frametime {}",
+            ctl.drain_ns,
+            target
+        );
+        assert!(ctl.gradient_ewma.is_finite());
+        assert!((-1.0..=1.0).contains(&ctl.gradient_ewma));
+    }
+
+    /// Without decoupling, drain must remain zero regardless of how many
+    /// frames we feed. Regression check for the early-return at the top of
+    /// `delay`.
+    #[test]
+    fn drain_stays_zero_when_coupled_long_run() {
+        let mut ctl = DelayController::new(false);
+        for _ in 0..1000 {
+            step_with_frametime(&mut ctl, 8_000_000);
+        }
+        assert_eq!(ctl.drain_ns, 0);
+    }
 }

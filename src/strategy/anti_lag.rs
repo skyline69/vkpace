@@ -58,7 +58,7 @@ impl AntiLagDeviceStrategy {
             st.enabled = data.mode != AntiLagModeAMD::OFF;
             let presentation = unsafe { data.p_presentation_info.as_ref() };
             let app_cap = compute_min_delay_ns(data.max_fps);
-            let layer_cap = self.device.instance.config.fps_cap_min_delay_ns();
+            let layer_cap = self.device.effective_min_delay_ns();
             // Use the stricter of the two caps (longer min_delay).
             let min_delay_ns = app_cap.max(layer_cap);
 
@@ -158,5 +158,18 @@ impl QueueStrategy for AntiLagQueueStrategy {
 
     fn as_anti_lag(&self) -> Option<&AntiLagQueueStrategy> {
         Some(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_min_delay_handles_zero_and_common_caps() {
+        assert_eq!(compute_min_delay_ns(0), 0);
+        assert_eq!(compute_min_delay_ns(60), 16_666_666);
+        assert_eq!(compute_min_delay_ns(144), 6_944_444);
+        assert_eq!(compute_min_delay_ns(240), 4_166_666);
     }
 }

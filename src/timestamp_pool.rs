@@ -342,7 +342,7 @@ impl TimestampPool {
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
-        let Some(write_ts) = fns.cmd_write_timestamp2 else {
+        let Some(write_ts) = fns.any_cmd_write_timestamp2() else {
             return Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT);
         };
         let Some(reset_qp) = fns.reset_query_pool else {

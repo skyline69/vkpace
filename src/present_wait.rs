@@ -22,9 +22,12 @@
 use ash::vk;
 use crossbeam_queue::SegQueue;
 use parking_lot::{Condvar, Mutex};
+use rustc_hash::FxHashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crate::clock::DeviceClock;
 use crate::dispatch::DeviceTable;
@@ -102,6 +105,158 @@ impl Drop for PresentWaitWorker {
         self.inner.wake.1.notify_all();
         if let Some(j) = self.handle.take() {
             let _ = j.join();
+        }
+    }
+}
+
+// ─── VK_GOOGLE_display_timing fallback ─────────────────────────────────────
+//
+// When `VK_KHR_present_wait` is unavailable but the driver exposes
+// `VK_GOOGLE_display_timing`, we can still surface per-present completion
+// time. The GOOGLE entrypoint returns timings in present-submission order
+// per swapchain, so the layer maintains a FIFO of `(KHR present_id)` per
+// swapchain and pairs each polled timing with the head of the FIFO.
+//
+// Correlation is ordering-based; we never round-trip the KHR `present_id`
+// through GOOGLE's 32-bit field. That avoids 32→64 wraparound surprises
+// when the app's KHR present_ids exceed 32 bits.
+
+/// Poll period between GOOGLE timing scans. ~5 ms keeps cost low at 240 Hz
+/// (1-2 records per poll on average) without missing tails.
+const GOOGLE_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Cap how many pending pids we hold per swapchain. Bounds memory if the
+/// driver stops producing timing samples for some reason.
+const GOOGLE_PENDING_CAP: usize = 256;
+
+struct GoogleInner {
+    device: vk::Device,
+    fns: Arc<DeviceTable>,
+    markers: Arc<MarkerHistory>,
+    pending: Mutex<FxHashMap<vk::SwapchainKHR, VecDeque<u64>>>,
+    wake: (Mutex<()>, Condvar),
+    stop: AtomicBool,
+}
+
+pub struct GoogleTimingWorker {
+    inner: Arc<GoogleInner>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl GoogleTimingWorker {
+    pub fn new(
+        device: vk::Device,
+        fns: Arc<DeviceTable>,
+        markers: Arc<MarkerHistory>,
+    ) -> Option<Self> {
+        // Need the polling entrypoint to do anything useful.
+        fns.get_past_presentation_timing_google?;
+        let inner = Arc::new(GoogleInner {
+            device,
+            fns,
+            markers,
+            pending: Mutex::new(FxHashMap::default()),
+            wake: (Mutex::new(()), Condvar::new()),
+            stop: AtomicBool::new(false),
+        });
+        let handle = {
+            let inner = inner.clone();
+            thread::Builder::new()
+                .name("vkpace-google-timing".into())
+                .spawn(move || run_google(inner))
+                .ok()
+        };
+        Some(Self { inner, handle })
+    }
+
+    pub fn enqueue(&self, swapchain: vk::SwapchainKHR, present_id: u64) {
+        if present_id == 0 {
+            return;
+        }
+        let mut pending = self.inner.pending.lock();
+        let fifo = pending.entry(swapchain).or_default();
+        if fifo.len() >= GOOGLE_PENDING_CAP {
+            fifo.pop_front();
+        }
+        fifo.push_back(present_id);
+        drop(pending);
+        let _g = self.inner.wake.0.lock();
+        self.inner.wake.1.notify_one();
+    }
+
+    pub fn forget_swapchain(&self, swapchain: vk::SwapchainKHR) {
+        self.inner.pending.lock().remove(&swapchain);
+    }
+}
+
+impl Drop for GoogleTimingWorker {
+    fn drop(&mut self) {
+        self.inner.stop.store(true, Ordering::SeqCst);
+        self.inner.wake.1.notify_all();
+        if let Some(j) = self.handle.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+fn run_google(inner: Arc<GoogleInner>) {
+    let poll = inner
+        .fns
+        .get_past_presentation_timing_google
+        .expect("worker constructed only when PFN exists");
+
+    // Reused per poll. Caps avoid spec-permitted unbounded responses.
+    let mut scratch: Vec<vk::PastPresentationTimingGOOGLE> = Vec::with_capacity(32);
+
+    while !inner.stop.load(Ordering::Acquire) {
+        // Snapshot swapchain list to avoid holding the pending lock across
+        // FFI. Keys only — values stay under the mutex.
+        let swapchains: Vec<vk::SwapchainKHR> = inner.pending.lock().keys().copied().collect();
+
+        for sw in swapchains {
+            let mut count: u32 = 0;
+            let r = unsafe { poll(inner.device, sw, &mut count, std::ptr::null_mut()) };
+            if r != vk::Result::SUCCESS || count == 0 {
+                continue;
+            }
+            // Bound the per-call alloc; we'll see the rest next tick.
+            let want = count.min(64) as usize;
+            scratch.clear();
+            scratch.resize(want, vk::PastPresentationTimingGOOGLE::default());
+            let mut got = want as u32;
+            let r = unsafe { poll(inner.device, sw, &mut got, scratch.as_mut_ptr()) };
+            if r != vk::Result::SUCCESS && r != vk::Result::INCOMPLETE {
+                continue;
+            }
+            scratch.truncate(got as usize);
+
+            let now_ns = DeviceClock::now();
+            let mut pending = inner.pending.lock();
+            let Some(fifo) = pending.get_mut(&sw) else {
+                continue;
+            };
+            for timing in &scratch {
+                let Some(pid) = fifo.pop_front() else {
+                    break;
+                };
+                // `actual_present_time` is in the driver's monotonic clock
+                // domain. Linux Mesa returns CLOCK_MONOTONIC, which matches
+                // DeviceClock::now() — store it directly. Fall back to
+                // "now" if the field is zero (driver didn't fill it).
+                let host_ns = if timing.actual_present_time != 0 {
+                    timing.actual_present_time
+                } else {
+                    now_ns
+                };
+                inner.markers.record_present_actual(pid, host_ns);
+            }
+        }
+
+        // Sleep ~poll_interval but wake early if a new present arrives
+        // (cuts latency on the very first frame after idle).
+        let mut g = inner.wake.0.lock();
+        if !inner.stop.load(Ordering::Acquire) {
+            let _ = inner.wake.1.wait_for(&mut g, GOOGLE_POLL_INTERVAL);
         }
     }
 }

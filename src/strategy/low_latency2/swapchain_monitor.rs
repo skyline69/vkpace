@@ -142,7 +142,7 @@ fn run(shared: Arc<Shared>) {
         }
 
         let app_delay = shared.state.lock().present_delay_ns;
-        let layer_delay = shared.device.instance.config.fps_cap_min_delay_ns();
+        let layer_delay = shared.device.effective_min_delay_ns();
         let delay_ns = app_delay.max(layer_delay);
 
         // Bounded wait across every group. Shared deadline: if the first

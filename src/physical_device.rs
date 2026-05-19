@@ -13,8 +13,14 @@ pub const REQUIRED_EXTENSIONS: &[&CStr] = &[
 /// Extensions we'd like to have but won't refuse the layer over. Enabled
 /// during `vkCreateDevice` only when the physical device advertises them.
 /// Present-wait/present-id unlock the real display-side completion-time
-/// path on Linux.
-pub const OPTIONAL_EXTENSIONS: &[&CStr] = &[vk::KHR_PRESENT_ID_NAME, vk::KHR_PRESENT_WAIT_NAME];
+/// path on Linux. `VK_GOOGLE_display_timing` is the fallback Mesa exposes
+/// when present-wait isn't available — slightly coarser ordering-based
+/// correlation, but enough to feed the Reflex overlay.
+pub const OPTIONAL_EXTENSIONS: &[&CStr] = &[
+    vk::KHR_PRESENT_ID_NAME,
+    vk::KHR_PRESENT_WAIT_NAME,
+    vk::GOOGLE_DISPLAY_TIMING_NAME,
+];
 
 pub struct PhysicalDeviceContext {
     pub instance: Arc<InstanceContext>,

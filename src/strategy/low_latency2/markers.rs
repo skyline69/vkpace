@@ -12,6 +12,7 @@
 
 use ash::vk;
 use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 
 use crate::clock::DeviceClock;
@@ -34,14 +35,29 @@ struct FrameMarkers {
     gpu_render_end_us: u64,
 }
 
+struct Inner {
+    frames: VecDeque<FrameMarkers>,
+    /// Sidecar `present_id → index in frames` map. Keeps `record()`
+    /// O(1) instead of scanning the deque on every marker call
+    /// (~6 markers × HISTORY_CAP frames). Indices are absolute frame
+    /// numbers; subtract `head_index` to get the slot in `frames`.
+    by_present_id: FxHashMap<u64, u64>,
+    /// Absolute index of the oldest frame currently in `frames`.
+    head_index: u64,
+}
+
 pub struct MarkerHistory {
-    frames: Mutex<VecDeque<FrameMarkers>>,
+    inner: Mutex<Inner>,
 }
 
 impl MarkerHistory {
     pub fn new() -> Self {
         Self {
-            frames: Mutex::new(VecDeque::with_capacity(HISTORY_CAP)),
+            inner: Mutex::new(Inner {
+                frames: VecDeque::with_capacity(HISTORY_CAP),
+                by_present_id: FxHashMap::default(),
+                head_index: 0,
+            }),
         }
     }
 
@@ -50,20 +66,28 @@ impl MarkerHistory {
     /// present_id arrives on a different marker in the same frame.
     pub fn record(&self, present_id: u64, marker: vk::LatencyMarkerNV) {
         let now_us = DeviceClock::now() / 1_000;
-        let mut frames = self.frames.lock();
+        let mut inner = self.inner.lock();
 
-        // Find the frame this marker belongs to, or push a new one.
-        let entry = match frames.iter_mut().rev().find(|f| f.present_id == present_id) {
-            Some(f) => f,
+        // O(1) lookup: hash → absolute index → slot.
+        let entry = match inner.by_present_id.get(&present_id).copied() {
+            Some(abs) => {
+                let slot = (abs - inner.head_index) as usize;
+                &mut inner.frames[slot]
+            }
             None => {
-                if frames.len() == HISTORY_CAP {
-                    frames.pop_front();
+                if inner.frames.len() == HISTORY_CAP {
+                    if let Some(old) = inner.frames.pop_front() {
+                        inner.by_present_id.remove(&old.present_id);
+                    }
+                    inner.head_index += 1;
                 }
-                frames.push_back(FrameMarkers {
+                let new_abs = inner.head_index + inner.frames.len() as u64;
+                inner.frames.push_back(FrameMarkers {
                     present_id,
                     ..Default::default()
                 });
-                frames.back_mut().unwrap()
+                inner.by_present_id.insert(present_id, new_abs);
+                inner.frames.back_mut().unwrap()
             }
         };
 
@@ -87,8 +111,10 @@ impl MarkerHistory {
     /// `present_id`. Called from the swapchain monitor after a frame's
     /// submission span completes and we know the timestamps.
     pub fn record_gpu_timing(&self, present_id: u64, start_host_ns: u64, end_host_ns: u64) {
-        let mut frames = self.frames.lock();
-        if let Some(f) = frames.iter_mut().rev().find(|f| f.present_id == present_id) {
+        let mut inner = self.inner.lock();
+        if let Some(abs) = inner.by_present_id.get(&present_id).copied() {
+            let slot = (abs - inner.head_index) as usize;
+            let f = &mut inner.frames[slot];
             f.gpu_render_start_us = start_host_ns / 1_000;
             f.gpu_render_end_us = end_host_ns / 1_000;
         }
@@ -103,9 +129,10 @@ impl MarkerHistory {
     /// timestamp is far more useful and is what the NVIDIA overlay
     /// surfaces as the frame's tail.
     pub fn record_present_actual(&self, present_id: u64, actual_host_ns: u64) {
-        let mut frames = self.frames.lock();
-        if let Some(f) = frames.iter_mut().rev().find(|f| f.present_id == present_id) {
-            f.present_end_us = actual_host_ns / 1_000;
+        let mut inner = self.inner.lock();
+        if let Some(abs) = inner.by_present_id.get(&present_id).copied() {
+            let slot = (abs - inner.head_index) as usize;
+            inner.frames[slot].present_end_us = actual_host_ns / 1_000;
         }
     }
 
@@ -114,16 +141,16 @@ impl MarkerHistory {
     /// `p_timings == NULL`, write `timing_count = HISTORY_CAP`; otherwise
     /// copy up to `timing_count` frames and write back the actual count.
     pub fn fill(&self, timings: &mut vk::GetLatencyMarkerInfoNV<'_>) {
-        let frames = self.frames.lock();
+        let inner = self.inner.lock();
 
         if timings.p_timings.is_null() {
-            timings.timing_count = frames.len() as u32;
+            timings.timing_count = inner.frames.len() as u32;
             return;
         }
 
         let max = timings.timing_count as usize;
-        let to_write = max.min(frames.len());
-        for (i, src) in frames.iter().rev().take(to_write).enumerate() {
+        let to_write = max.min(inner.frames.len());
+        for (i, src) in inner.frames.iter().rev().take(to_write).enumerate() {
             let dst = unsafe { &mut *timings.p_timings.add(i) };
             *dst = vk::LatencyTimingsFrameReportNV::default()
                 .present_id(src.present_id)
@@ -144,5 +171,114 @@ impl MarkerHistory {
 impl Default for MarkerHistory {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl crate::telemetry::LatencySource for MarkerHistory {
+    /// Append click-to-photon samples (µs) for every frame in the window
+    /// that has both an input sample and a present-end timestamp. Frames
+    /// missing either marker are skipped — the layer can't compute a
+    /// meaningful latency without both ends.
+    fn latencies_us(&self, out: &mut Vec<u64>) {
+        let inner = self.inner.lock();
+        for f in inner.frames.iter() {
+            if f.input_sample_us != 0 && f.present_end_us > f.input_sample_us {
+                out.push(f.present_end_us - f.input_sample_us);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::LatencySource;
+
+    #[test]
+    fn record_dedupes_by_present_id() {
+        let h = MarkerHistory::new();
+        for m in [
+            vk::LatencyMarkerNV::INPUT_SAMPLE,
+            vk::LatencyMarkerNV::SIMULATION_START,
+            vk::LatencyMarkerNV::PRESENT_END,
+        ] {
+            h.record(42, m);
+        }
+        let inner = h.inner.lock();
+        assert_eq!(inner.frames.len(), 1);
+        assert_eq!(inner.frames[0].present_id, 42);
+    }
+
+    /// Two-call protocol per Vulkan convention: first call with NULL
+    /// p_timings must populate `timing_count`, second call (or any with
+    /// non-NULL p_timings) writes that many entries.
+    #[test]
+    fn fill_two_call_protocol_returns_count_with_null_buffer() {
+        let h = MarkerHistory::new();
+        for pid in 1..=5u64 {
+            h.record(pid, vk::LatencyMarkerNV::INPUT_SAMPLE);
+        }
+        let mut info = vk::GetLatencyMarkerInfoNV {
+            p_timings: std::ptr::null_mut(),
+            timing_count: 0,
+            ..Default::default()
+        };
+        h.fill(&mut info);
+        assert_eq!(info.timing_count, 5);
+    }
+
+    #[test]
+    fn fill_writes_up_to_requested_count_in_reverse_order() {
+        let h = MarkerHistory::new();
+        for pid in 1..=5u64 {
+            h.record(pid, vk::LatencyMarkerNV::INPUT_SAMPLE);
+        }
+        let mut buf: Vec<vk::LatencyTimingsFrameReportNV> =
+            vec![vk::LatencyTimingsFrameReportNV::default(); 3];
+        let mut info = vk::GetLatencyMarkerInfoNV {
+            p_timings: buf.as_mut_ptr(),
+            timing_count: buf.len() as u32,
+            ..Default::default()
+        };
+        h.fill(&mut info);
+        assert_eq!(info.timing_count, 3);
+        // Newest-first per fill loop (`.iter().rev()`).
+        assert_eq!(buf[0].present_id, 5);
+        assert_eq!(buf[1].present_id, 4);
+        assert_eq!(buf[2].present_id, 3);
+    }
+
+    #[test]
+    fn history_cap_evicts_oldest() {
+        let h = MarkerHistory::new();
+        for pid in 0..(HISTORY_CAP + 32) as u64 {
+            h.record(pid, vk::LatencyMarkerNV::INPUT_SAMPLE);
+        }
+        let inner = h.inner.lock();
+        assert_eq!(inner.frames.len(), HISTORY_CAP);
+        assert_eq!(inner.frames.front().unwrap().present_id, 32);
+        assert_eq!(
+            inner.frames.back().unwrap().present_id,
+            (HISTORY_CAP + 31) as u64
+        );
+        // Sidecar map must mirror the deque exactly.
+        assert_eq!(inner.by_present_id.len(), HISTORY_CAP);
+    }
+
+    #[test]
+    fn latency_source_skips_frames_missing_endpoints() {
+        let h = MarkerHistory::new();
+        h.record(1, vk::LatencyMarkerNV::INPUT_SAMPLE);
+        // Manually set present_end to avoid timing dependence on the clock.
+        {
+            let mut inner = h.inner.lock();
+            inner.frames[0].input_sample_us = 100;
+            inner.frames[0].present_end_us = 500;
+        }
+        h.record(2, vk::LatencyMarkerNV::INPUT_SAMPLE);
+        // pid=2 has no present_end → skipped.
+        let mut out = Vec::new();
+        h.latencies_us(&mut out);
+        assert_eq!(out, vec![400]);
     }
 }

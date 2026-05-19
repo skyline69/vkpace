@@ -61,8 +61,16 @@ pub struct InstanceTable {
     pub get_physical_device_queue_family_properties:
         vk::PFN_vkGetPhysicalDeviceQueueFamilyProperties,
     // ── Optional (Vulkan 1.1+ / KHR extensions) ────────────────────────────
+    //
+    // Core and `*KHR` aliases are loaded into separate slots so the layer
+    // can dispatch to the same variant the application invoked. Collapsing
+    // them caused parity issues — apps that loaded only the `*KHR` variant
+    // on a Vulkan-1.0 instance ended up calling a nonexistent core PFN.
     pub get_physical_device_properties2: Option<vk::PFN_vkGetPhysicalDeviceProperties2>,
+    // ash collapses the `*KHR` PFN aliases onto the core typedef.
+    pub get_physical_device_properties2_khr: Option<vk::PFN_vkGetPhysicalDeviceProperties2>,
     pub get_physical_device_features2: Option<vk::PFN_vkGetPhysicalDeviceFeatures2>,
+    pub get_physical_device_features2_khr: Option<vk::PFN_vkGetPhysicalDeviceFeatures2>,
     pub get_physical_device_surface_capabilities2_khr:
         Option<vk::PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR>,
 }
@@ -105,14 +113,22 @@ impl InstanceTable {
                     gipa,
                     instance,
                     c"vkGetPhysicalDeviceProperties2",
-                )
-                .or_else(|| load_inst(gipa, instance, c"vkGetPhysicalDeviceProperties2KHR")),
+                ),
+                get_physical_device_properties2_khr: load_inst(
+                    gipa,
+                    instance,
+                    c"vkGetPhysicalDeviceProperties2KHR",
+                ),
                 get_physical_device_features2: load_inst(
                     gipa,
                     instance,
                     c"vkGetPhysicalDeviceFeatures2",
-                )
-                .or_else(|| load_inst(gipa, instance, c"vkGetPhysicalDeviceFeatures2KHR")),
+                ),
+                get_physical_device_features2_khr: load_inst(
+                    gipa,
+                    instance,
+                    c"vkGetPhysicalDeviceFeatures2KHR",
+                ),
                 get_physical_device_surface_capabilities2_khr: load_inst(
                     gipa,
                     instance,
@@ -141,9 +157,13 @@ pub struct DeviceTable {
     pub device_wait_idle: vk::PFN_vkDeviceWaitIdle,
     // ── Optional ───────────────────────────────────────────────────────────
     pub get_device_queue2: Option<vk::PFN_vkGetDeviceQueue2>,
+    // Core + KHR alias slots kept separate so the layer dispatches the
+    // same variant the caller invoked.
     pub queue_submit2: Option<vk::PFN_vkQueueSubmit2>,
+    pub queue_submit2_khr: Option<vk::PFN_vkQueueSubmit2>,
     pub queue_present_khr: Option<vk::PFN_vkQueuePresentKHR>,
     pub cmd_write_timestamp2: Option<vk::PFN_vkCmdWriteTimestamp2>,
+    pub cmd_write_timestamp2_khr: Option<vk::PFN_vkCmdWriteTimestamp2>,
     pub reset_query_pool: Option<vk::PFN_vkResetQueryPool>,
     pub get_calibrated_timestamps_khr: Option<vk::PFN_vkGetCalibratedTimestampsKHR>,
     pub create_swapchain_khr: Option<vk::PFN_vkCreateSwapchainKHR>,
@@ -153,6 +173,8 @@ pub struct DeviceTable {
     pub signal_semaphore: Option<vk::PFN_vkSignalSemaphore>,
     pub get_semaphore_counter_value: Option<vk::PFN_vkGetSemaphoreCounterValue>,
     pub wait_for_present_khr: Option<vk::PFN_vkWaitForPresentKHR>,
+    pub get_refresh_cycle_duration_google: Option<vk::PFN_vkGetRefreshCycleDurationGOOGLE>,
+    pub get_past_presentation_timing_google: Option<vk::PFN_vkGetPastPresentationTimingGOOGLE>,
 }
 
 impl DeviceTable {
@@ -192,11 +214,11 @@ impl DeviceTable {
                     .expect("vkDeviceWaitIdle must exist"),
 
                 get_device_queue2: load_dev(gdpa, device, c"vkGetDeviceQueue2"),
-                queue_submit2: load_dev(gdpa, device, c"vkQueueSubmit2")
-                    .or_else(|| load_dev(gdpa, device, c"vkQueueSubmit2KHR")),
+                queue_submit2: load_dev(gdpa, device, c"vkQueueSubmit2"),
+                queue_submit2_khr: load_dev(gdpa, device, c"vkQueueSubmit2KHR"),
                 queue_present_khr: load_dev(gdpa, device, c"vkQueuePresentKHR"),
-                cmd_write_timestamp2: load_dev(gdpa, device, c"vkCmdWriteTimestamp2")
-                    .or_else(|| load_dev(gdpa, device, c"vkCmdWriteTimestamp2KHR")),
+                cmd_write_timestamp2: load_dev(gdpa, device, c"vkCmdWriteTimestamp2"),
+                cmd_write_timestamp2_khr: load_dev(gdpa, device, c"vkCmdWriteTimestamp2KHR"),
                 reset_query_pool: load_dev(gdpa, device, c"vkResetQueryPool")
                     .or_else(|| load_dev(gdpa, device, c"vkResetQueryPoolEXT")),
                 get_calibrated_timestamps_khr: load_dev(
@@ -214,7 +236,27 @@ impl DeviceTable {
                 get_semaphore_counter_value: load_dev(gdpa, device, c"vkGetSemaphoreCounterValue")
                     .or_else(|| load_dev(gdpa, device, c"vkGetSemaphoreCounterValueKHR")),
                 wait_for_present_khr: load_dev(gdpa, device, c"vkWaitForPresentKHR"),
+                get_refresh_cycle_duration_google: load_dev(
+                    gdpa,
+                    device,
+                    c"vkGetRefreshCycleDurationGOOGLE",
+                ),
+                get_past_presentation_timing_google: load_dev(
+                    gdpa,
+                    device,
+                    c"vkGetPastPresentationTimingGOOGLE",
+                ),
             }
         }
+    }
+}
+
+impl DeviceTable {
+    /// Best-available `vkCmdWriteTimestamp2` PFN for layer-injected
+    /// command buffers. Core + KHR slots alias to the same typedef and
+    /// the spec guarantees identical semantics.
+    #[inline]
+    pub fn any_cmd_write_timestamp2(&self) -> Option<vk::PFN_vkCmdWriteTimestamp2> {
+        self.cmd_write_timestamp2.or(self.cmd_write_timestamp2_khr)
     }
 }

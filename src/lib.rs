@@ -642,6 +642,31 @@ unsafe extern "system" fn queue_submit2(
     p_submits: *const vk::SubmitInfo2<'_>,
     fence: vk::Fence,
 ) -> vk::Result {
+    unsafe { queue_submit2_dispatch(queue, submit_count, p_submits, fence, Submit2Variant::Core) }
+}
+
+unsafe extern "system" fn queue_submit2_khr(
+    queue: vk::Queue,
+    submit_count: u32,
+    p_submits: *const vk::SubmitInfo2<'_>,
+    fence: vk::Fence,
+) -> vk::Result {
+    unsafe { queue_submit2_dispatch(queue, submit_count, p_submits, fence, Submit2Variant::Khr) }
+}
+
+#[derive(Clone, Copy)]
+enum Submit2Variant {
+    Core,
+    Khr,
+}
+
+unsafe fn queue_submit2_dispatch(
+    queue: vk::Queue,
+    submit_count: u32,
+    p_submits: *const vk::SubmitInfo2<'_>,
+    fence: vk::Fence,
+    variant: Submit2Variant,
+) -> vk::Result {
     crate::catch::vk_result(|| {
         let Some(qctx) = registry::QUEUES
             .get(&registry::key(queue))
@@ -650,7 +675,15 @@ unsafe extern "system" fn queue_submit2(
             return vk::Result::ERROR_INITIALIZATION_FAILED;
         };
         let fns = &qctx.device.fns;
-        let Some(submit2) = fns.queue_submit2 else {
+        // Dispatch the same variant the caller invoked. Fall back to the
+        // other slot only if the driver didn't expose the requested one —
+        // shouldn't happen in a well-formed loader chain but keeps the
+        // layer from returning INITIALIZATION_FAILED on edge drivers.
+        let submit2 = match variant {
+            Submit2Variant::Core => fns.queue_submit2.or(fns.queue_submit2_khr),
+            Submit2Variant::Khr => fns.queue_submit2_khr.or(fns.queue_submit2),
+        };
+        let Some(submit2) = submit2 else {
             return vk::Result::ERROR_INITIALIZATION_FAILED;
         };
         if submit_count == 0 {
@@ -778,10 +811,19 @@ unsafe extern "system" fn queue_present_khr(
             if let Some(s) = qctx.device.strategy.get().and_then(|s| s.as_low_latency2()) {
                 strategy::low_latency2::forward_present(s, info);
             }
+            // VRR soft target needs a swapchain handle to query refresh
+            // duration; first present is the earliest point we have one.
+            if info.swapchain_count > 0 {
+                let sw = unsafe { *info.p_swapchains };
+                qctx.device.ensure_vrr_target(sw);
+            }
             // Enqueue a vkWaitForPresentKHR per (swapchain, present_id) if
-            // the device has a worker. This is the path that records actual
-            // display-side completion time into the marker history.
-            if let Some(worker) = qctx.device.present_wait.get() {
+            // the device has a KHR worker, else fall through to the GOOGLE
+            // display-timing worker. Either path records actual display-side
+            // completion time into the marker history.
+            let khr = qctx.device.present_wait.get();
+            let google = qctx.device.google_timing.get();
+            if khr.is_some() || google.is_some() {
                 let present_ids = unsafe {
                     pnext::find::<vk::PresentIdKHR>(info.p_next, vk::StructureType::PRESENT_ID_KHR)
                         .and_then(|p| {
@@ -797,8 +839,13 @@ unsafe extern "system" fn queue_present_khr(
                 for i in 0..info.swapchain_count as usize {
                     let swapchain = unsafe { *info.p_swapchains.add(i) };
                     let pid = present_ids.map(|s| s[i]).unwrap_or(0);
-                    if pid != 0 {
-                        worker.enqueue(swapchain, pid);
+                    if pid == 0 {
+                        continue;
+                    }
+                    if let Some(w) = khr {
+                        w.enqueue(swapchain, pid);
+                    } else if let Some(w) = google {
+                        w.enqueue(swapchain, pid);
                     }
                 }
             }
@@ -912,6 +959,9 @@ unsafe extern "system" fn destroy_swapchain_khr(
         if let Some(s) = ctx.strategy.get() {
             s.notify_destroy_swapchain(swapchain);
         }
+        if let Some(w) = ctx.google_timing.get() {
+            w.forget_swapchain(swapchain);
+        }
         if let Some(destroy) = ctx.fns.destroy_swapchain_khr {
             unsafe { destroy(device, swapchain, p_allocator) };
         }
@@ -944,6 +994,21 @@ unsafe extern "system" fn get_physical_device_properties2(
     physical_device: vk::PhysicalDevice,
     p_properties: *mut vk::PhysicalDeviceProperties2<'_>,
 ) {
+    unsafe { get_physical_device_properties2_dispatch(physical_device, p_properties, false) }
+}
+
+unsafe extern "system" fn get_physical_device_properties2_khr(
+    physical_device: vk::PhysicalDevice,
+    p_properties: *mut vk::PhysicalDeviceProperties2<'_>,
+) {
+    unsafe { get_physical_device_properties2_dispatch(physical_device, p_properties, true) }
+}
+
+unsafe fn get_physical_device_properties2_dispatch(
+    physical_device: vk::PhysicalDevice,
+    p_properties: *mut vk::PhysicalDeviceProperties2<'_>,
+    khr: bool,
+) {
     crate::catch::vk_void(|| {
         let Some(pd) = registry::PHYSICAL_DEVICES
             .get(&registry::key(physical_device))
@@ -951,7 +1016,20 @@ unsafe extern "system" fn get_physical_device_properties2(
         else {
             return;
         };
-        let Some(getp2) = pd.instance.fns.get_physical_device_properties2 else {
+        // Honor caller variant; fall back to the other slot only if the
+        // requested PFN wasn't loaded.
+        let getp2 = if khr {
+            pd.instance
+                .fns
+                .get_physical_device_properties2_khr
+                .or(pd.instance.fns.get_physical_device_properties2)
+        } else {
+            pd.instance
+                .fns
+                .get_physical_device_properties2
+                .or(pd.instance.fns.get_physical_device_properties2_khr)
+        };
+        let Some(getp2) = getp2 else {
             return;
         };
         unsafe { getp2(physical_device, p_properties) };
@@ -979,6 +1057,21 @@ unsafe extern "system" fn get_physical_device_features2(
     physical_device: vk::PhysicalDevice,
     p_features: *mut vk::PhysicalDeviceFeatures2<'_>,
 ) {
+    unsafe { get_physical_device_features2_dispatch(physical_device, p_features, false) }
+}
+
+unsafe extern "system" fn get_physical_device_features2_khr(
+    physical_device: vk::PhysicalDevice,
+    p_features: *mut vk::PhysicalDeviceFeatures2<'_>,
+) {
+    unsafe { get_physical_device_features2_dispatch(physical_device, p_features, true) }
+}
+
+unsafe fn get_physical_device_features2_dispatch(
+    physical_device: vk::PhysicalDevice,
+    p_features: *mut vk::PhysicalDeviceFeatures2<'_>,
+    khr: bool,
+) {
     crate::catch::vk_void(|| {
         let Some(pd) = registry::PHYSICAL_DEVICES
             .get(&registry::key(physical_device))
@@ -986,7 +1079,18 @@ unsafe extern "system" fn get_physical_device_features2(
         else {
             return;
         };
-        let Some(getf2) = pd.instance.fns.get_physical_device_features2 else {
+        let getf2 = if khr {
+            pd.instance
+                .fns
+                .get_physical_device_features2_khr
+                .or(pd.instance.fns.get_physical_device_features2)
+        } else {
+            pd.instance
+                .fns
+                .get_physical_device_features2
+                .or(pd.instance.fns.get_physical_device_features2_khr)
+        };
+        let Some(getf2) = getf2 else {
             return;
         };
         unsafe { getf2(physical_device, p_features) };
@@ -1586,7 +1690,7 @@ static INSTANCE_FUNCTIONS: Lazy<FxHashMap<&'static [u8], vk::PFN_vkVoidFunction>
         );
         e!(
             b"vkGetPhysicalDeviceProperties2KHR",
-            get_physical_device_properties2
+            get_physical_device_properties2_khr
         );
         e!(
             b"vkGetPhysicalDeviceFeatures2",
@@ -1594,7 +1698,7 @@ static INSTANCE_FUNCTIONS: Lazy<FxHashMap<&'static [u8], vk::PFN_vkVoidFunction>
         );
         e!(
             b"vkGetPhysicalDeviceFeatures2KHR",
-            get_physical_device_features2
+            get_physical_device_features2_khr
         );
         e!(
             b"vkGetPhysicalDeviceSurfaceCapabilities2KHR",
@@ -1619,7 +1723,7 @@ static DEVICE_FUNCTIONS: Lazy<FxHashMap<&'static [u8], vk::PFN_vkVoidFunction>> 
     e!(b"vkGetDeviceQueue2", get_device_queue2);
     e!(b"vkQueueSubmit", queue_submit);
     e!(b"vkQueueSubmit2", queue_submit2);
-    e!(b"vkQueueSubmit2KHR", queue_submit2);
+    e!(b"vkQueueSubmit2KHR", queue_submit2_khr);
     e!(b"vkQueuePresentKHR", queue_present_khr);
     e!(b"vkCreateSwapchainKHR", create_swapchain_khr);
     e!(b"vkDestroySwapchainKHR", destroy_swapchain_khr);

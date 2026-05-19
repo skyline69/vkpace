@@ -166,6 +166,43 @@ fn gipa_returns_none_for_unknown_global() {
 }
 
 #[test]
+fn gipa_resolves_core_and_khr_variants_to_distinct_shims() {
+    // After splitting variant dispatch, the loader-facing `*KHR` aliases
+    // for sync2/feature2/properties2 must resolve to a *different* trampoline
+    // than the core entrypoint — that's how the layer can dispatch the same
+    // variant the application invoked. If they collapse to the same PFN we
+    // regressed back to the pre-split behavior.
+    let h = open_layer();
+    let gipa: unsafe extern "system" fn(
+        *mut c_void,
+        *const c_char,
+    ) -> Option<unsafe extern "system" fn()> = unsafe { dlsym(h, c"VkPace_GetInstanceProcAddr") }
+        .expect("VkPace_GetInstanceProcAddr missing");
+
+    let pairs: &[(&CStr, &CStr)] = &[
+        (
+            c"vkGetPhysicalDeviceProperties2",
+            c"vkGetPhysicalDeviceProperties2KHR",
+        ),
+        (
+            c"vkGetPhysicalDeviceFeatures2",
+            c"vkGetPhysicalDeviceFeatures2KHR",
+        ),
+    ];
+    for (core, khr) in pairs {
+        let a = unsafe { gipa(std::ptr::null_mut(), core.as_ptr()) };
+        let b = unsafe { gipa(std::ptr::null_mut(), khr.as_ptr()) };
+        let a = a.expect("core entrypoint missing");
+        let b = b.expect("KHR alias missing");
+        assert_ne!(
+            a as usize, b as usize,
+            "{:?} and {:?} resolved to the same trampoline — variant dispatch collapsed",
+            core, khr
+        );
+    }
+}
+
+#[test]
 fn gipa_returns_none_for_null_name() {
     let h = open_layer();
     let gipa: unsafe extern "system" fn(

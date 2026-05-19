@@ -11,7 +11,14 @@ const SPOOF_NVIDIA_ENV: &str = "VKPACE_SPOOF_NVIDIA";
 const SPOOF_MODEL_ENV: &str = "VKPACE_SPOOF_MODEL";
 const FORCE_DECOUPLED_ENV: &str = "VKPACE_FORCE_DECOUPLED";
 const FPS_CAP_ENV: &str = "VKPACE_FPS_CAP";
+const VRR_ENV: &str = "VKPACE_VRR";
+const VRR_OFFSET_ENV: &str = "VKPACE_VRR_OFFSET";
 const CONFIG_PATH_ENV: &str = "VKPACE_CONFIG";
+
+/// Default Hz subtracted from the display's refresh rate to derive a soft
+/// FPS target under VRR. Matches the LFC heuristic most Reflex/G-Sync
+/// users dial in by hand.
+pub const DEFAULT_VRR_OFFSET_HZ: u32 = 3;
 
 const DECOUPLED_SIMULATION_APPS: &[&str] = &["Marvel-Win64-Shipping.exe"];
 
@@ -86,6 +93,12 @@ pub struct LayerConfig {
     pub spoof_profile: SpoofProfile,
     /// Hard FPS cap applied in the delay controller. 0 = no cap.
     pub fps_cap: u32,
+    /// Enable soft VRR pacing: target the display's refresh rate minus
+    /// `vrr_offset_hz` as an effective FPS cap. Only takes effect when the
+    /// driver exposes `VK_GOOGLE_display_timing` so the layer can read the
+    /// refresh duration.
+    pub vrr_enabled: bool,
+    pub vrr_offset_hz: u32,
     /// Per-app overrides, sourced from TOML. Keyed by exact match against
     /// `pApplicationInfo.pApplicationName`.
     pub per_app: Vec<AppOverride>,
@@ -98,6 +111,8 @@ pub struct AppOverride {
     pub spoof_nvidia: Option<bool>,
     pub force_decoupled: Option<bool>,
     pub fps_cap: Option<u32>,
+    pub vrr_enabled: Option<bool>,
+    pub vrr_offset_hz: Option<u32>,
     pub spoof_model: Option<String>,
 }
 
@@ -109,6 +124,11 @@ impl LayerConfig {
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(0);
+        let vrr_enabled = env_flag(VRR_ENV);
+        let vrr_offset_hz = env::var(VRR_OFFSET_ENV)
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_VRR_OFFSET_HZ);
         let per_app = load_toml().unwrap_or_default();
         Self {
             expose_reflex: env_flag(REFLEX_ENV),
@@ -116,6 +136,8 @@ impl LayerConfig {
             force_decoupled: env_flag(FORCE_DECOUPLED_ENV),
             spoof_profile,
             fps_cap,
+            vrr_enabled,
+            vrr_offset_hz,
             per_app,
         }
     }
@@ -138,6 +160,12 @@ impl LayerConfig {
             }
             if let Some(v) = over.fps_cap {
                 out.fps_cap = v;
+            }
+            if let Some(v) = over.vrr_enabled {
+                out.vrr_enabled = v;
+            }
+            if let Some(v) = over.vrr_offset_hz {
+                out.vrr_offset_hz = v;
             }
             if let Some(ref model) = over.spoof_model {
                 out.spoof_profile = resolve_spoof_profile(Some(model));
@@ -251,13 +279,16 @@ fn load_toml() -> Option<Vec<AppOverride>> {
             if let Some(prev) = current.take() {
                 overrides.push(prev);
             }
-            let name = rest.trim_end_matches(']').trim_matches('"');
+            let trimmed = rest.trim_end_matches(']');
+            let name = strip_quotes(trimmed);
             current = Some(AppOverride {
                 app_name: name.to_owned(),
                 expose_reflex: None,
                 spoof_nvidia: None,
                 force_decoupled: None,
                 fps_cap: None,
+                vrr_enabled: None,
+                vrr_offset_hz: None,
                 spoof_model: None,
             });
             continue;
@@ -274,12 +305,18 @@ fn load_toml() -> Option<Vec<AppOverride>> {
             continue;
         };
         let k = k.trim();
-        let v = v.trim().trim_matches('"');
+        // Strip exactly one matched pair of surrounding `"`, preserving any
+        // embedded quotes inside the string. Earlier `trim_matches('"')`
+        // chewed through *all* leading/trailing quote characters and broke
+        // app names that genuinely contain a `"`.
+        let v = strip_quotes(v.trim());
         match k {
             "expose_reflex" => cur.expose_reflex = parse_bool(v),
             "spoof_nvidia" => cur.spoof_nvidia = parse_bool(v),
             "force_decoupled" => cur.force_decoupled = parse_bool(v),
             "fps_cap" => cur.fps_cap = v.parse().ok(),
+            "vrr" => cur.vrr_enabled = parse_bool(v),
+            "vrr_offset" => cur.vrr_offset_hz = v.parse().ok(),
             "spoof_model" => cur.spoof_model = Some(v.to_owned()),
             unknown => eprintln!("[vkpace] unknown config key: {unknown}"),
         }
@@ -288,6 +325,16 @@ fn load_toml() -> Option<Vec<AppOverride>> {
         overrides.push(prev);
     }
     Some(overrides)
+}
+
+/// Strip exactly one pair of matched leading/trailing double quotes.
+/// `"foo"` → `foo`, `"a\"b"` → `a\"b`, `foo"bar` → `foo"bar`.
+fn strip_quotes(s: &str) -> &str {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
 }
 
 fn parse_bool(s: &str) -> Option<bool> {
@@ -341,6 +388,8 @@ mod tests {
                 device_name: "",
             },
             fps_cap: 0,
+            vrr_enabled: false,
+            vrr_offset_hz: DEFAULT_VRR_OFFSET_HZ,
             per_app: Vec::new(),
         };
         assert!(cfg.is_known_decoupled(Some("Marvel-Win64-Shipping.exe")));
@@ -359,6 +408,8 @@ mod tests {
                 device_name: "",
             },
             fps_cap: 0,
+            vrr_enabled: false,
+            vrr_offset_hz: DEFAULT_VRR_OFFSET_HZ,
             per_app: Vec::new(),
         };
         assert!(cfg.is_known_decoupled(None));
@@ -376,6 +427,8 @@ mod tests {
                 device_name: "",
             },
             fps_cap: 0,
+            vrr_enabled: false,
+            vrr_offset_hz: DEFAULT_VRR_OFFSET_HZ,
             per_app: Vec::new(),
         };
         assert_eq!(cfg.fps_cap_min_delay_ns(), 0);
@@ -396,12 +449,16 @@ mod tests {
                 device_name: "",
             },
             fps_cap: 0,
+            vrr_enabled: false,
+            vrr_offset_hz: DEFAULT_VRR_OFFSET_HZ,
             per_app: vec![AppOverride {
                 app_name: "test.exe".into(),
                 expose_reflex: Some(true),
                 spoof_nvidia: Some(true),
                 force_decoupled: None,
                 fps_cap: Some(144),
+                vrr_enabled: None,
+                vrr_offset_hz: None,
                 spoof_model: Some("RTX_4090".into()),
             }],
         };
@@ -410,6 +467,36 @@ mod tests {
         assert!(final_cfg.spoof_nvidia);
         assert_eq!(final_cfg.fps_cap, 144);
         assert_eq!(final_cfg.spoof_profile.device_id, 0x2684);
+    }
+
+    #[test]
+    fn strip_quotes_preserves_embedded() {
+        assert_eq!(strip_quotes("\"foo\""), "foo");
+        assert_eq!(strip_quotes("foo"), "foo");
+        // Embedded quote survives — old `trim_matches('"')` ate it.
+        assert_eq!(strip_quotes("\"a\"b\""), "a\"b");
+        assert_eq!(strip_quotes("\""), "\"");
+        assert_eq!(strip_quotes(""), "");
+    }
+
+    #[test]
+    fn parse_bool_accepts_canonical_forms() {
+        assert_eq!(parse_bool("true"), Some(true));
+        assert_eq!(parse_bool("1"), Some(true));
+        assert_eq!(parse_bool("false"), Some(false));
+        assert_eq!(parse_bool("0"), Some(false));
+        assert_eq!(parse_bool("yes"), None);
+        assert_eq!(parse_bool(""), None);
+    }
+
+    #[test]
+    fn unknown_spoof_preset_falls_back_to_default() {
+        let p = resolve_spoof_profile(Some("RTX_99999"));
+        let default = NVIDIA_PRESETS
+            .iter()
+            .find(|(k, _, _)| *k == DEFAULT_PRESET)
+            .unwrap();
+        assert_eq!(p.device_id, default.1);
     }
 
     #[test]
@@ -423,12 +510,16 @@ mod tests {
                 device_name: "",
             },
             fps_cap: 0,
+            vrr_enabled: false,
+            vrr_offset_hz: DEFAULT_VRR_OFFSET_HZ,
             per_app: vec![AppOverride {
                 app_name: "test.exe".into(),
                 expose_reflex: Some(true),
                 spoof_nvidia: None,
                 force_decoupled: None,
                 fps_cap: None,
+                vrr_enabled: None,
+                vrr_offset_hz: None,
                 spoof_model: None,
             }],
         };
