@@ -37,6 +37,34 @@ pub struct HudApp {
     fps_y_max: f64,
     frametime_y_max: f64,
     latency_y_max: f64,
+    /// Cached aggregates. `update()` recomputes them only when
+    /// `now_ns / RECOMPUTE_INTERVAL_NS` advances — during a window resize
+    /// the compositor floods the event loop and forces `update()` to run
+    /// at compositor rate (60-240 Hz on Wayland). Without caching, each
+    /// of those calls re-clones the 4096-record snapshot and runs
+    /// bin_records 5 times, which is the actual source of the laggy
+    /// resize *and* the GPU-contention drop in game fps. With caching
+    /// the heavy work stays bounded at ~10 Hz regardless of repaint rate.
+    cache: PlotCache,
+}
+
+/// Recompute aggregates at most this often. 100 ms is a fifth of BIN_NS,
+/// fast enough that the human eye can't see the staleness (eye persistence
+/// is ~30 ms but for a plot this slow it's fine) and slow enough that the
+/// cost is negligible during resize.
+const RECOMPUTE_INTERVAL_NS: u64 = 100_000_000;
+
+#[derive(Default)]
+struct PlotCache {
+    last_now_ns: u64,
+    live: stats::LiveStats,
+    drops: u64,
+    samples: usize,
+    fps_pts: Vec<[f64; 2]>,
+    p50_pts: Vec<[f64; 2]>,
+    p99_pts: Vec<[f64; 2]>,
+    max_pts: Vec<[f64; 2]>,
+    frametime_pts: Vec<[f64; 2]>,
 }
 
 impl HudApp {
@@ -46,6 +74,7 @@ impl HudApp {
             fps_y_max: 160.0,
             frametime_y_max: 33.0,
             latency_y_max: 30_000.0,
+            cache: PlotCache::default(),
         }
     }
 }
@@ -68,40 +97,32 @@ impl eframe::App for HudApp {
 
         let connected = self.state.connected.load(Ordering::Acquire);
         let now_ns = self.state.latest_ts().unwrap_or(0);
-        let snapshot = if now_ns > 0 {
-            self.state.snapshot_since(now_ns.saturating_sub(WINDOW_NS))
-        } else {
-            Vec::new()
-        };
-        let live = stats::live_stats(&snapshot, now_ns, STATS_WINDOW_NS);
-        let drops: u64 = stats::frame_gaps(&snapshot)
-            .iter()
-            .map(|p| p[1] as u64)
-            .sum();
 
-        top_strip(ctx, connected, &live, drops);
+        // Only recompute aggregates when the bin-quantized `now` advances.
+        // Resize floods us with cheap renders that read these caches; the
+        // heavy work stays clamped to ~10 Hz.
+        let now_bucket = now_ns / RECOMPUTE_INTERVAL_NS;
+        let last_bucket = self.cache.last_now_ns / RECOMPUTE_INTERVAL_NS;
+        if now_ns > 0 && now_bucket != last_bucket {
+            self.recompute_cache(now_ns);
+        }
 
-        // Update smoothed Y bounds from the visible snapshot. Targets are
-        // computed once per frame so the plot's `.include_y(...)` reads a
-        // stable value during render.
+        // Smooth Y bounds — done outside the cache because the EMA needs
+        // to step every frame for the visual to feel responsive on first
+        // launch. The arithmetic is trivial (three f64 ops) so it's
+        // cheap even at compositor rate.
+        let live = &self.cache.live;
         let fps_target = (live.fps * 1.25).max(160.0);
-        let frametime_target = (live
-            .fps
-            .max(30.0)
-            .recip()
-            * 1000.0
-            * 2.0)
-            .max(20.0);
+        let frametime_target = (live.fps.max(30.0).recip() * 1000.0 * 2.0).max(20.0);
         let latency_target = ((live.max_us as f64) * 1.4).max(8_000.0);
         self.fps_y_max = smooth_bound(self.fps_y_max, fps_target, 60.0, 600.0);
         self.frametime_y_max = smooth_bound(self.frametime_y_max, frametime_target, 16.0, 200.0);
         self.latency_y_max = smooth_bound(self.latency_y_max, latency_target, 8_000.0, 200_000.0);
 
-        plots(
+        top_strip(ctx, connected, &self.cache.live, self.cache.drops);
+        plots_cached(
             ctx,
-            &snapshot,
-            now_ns,
-            live.samples,
+            &self.cache,
             self.fps_y_max,
             self.frametime_y_max,
             self.latency_y_max,
@@ -110,6 +131,79 @@ impl eframe::App for HudApp {
 
     fn on_exit(&mut self) {
         self.state.stop.store(true, Ordering::Release);
+    }
+}
+
+impl HudApp {
+    /// Recompute snapshot + stats + plot series. Runs at most every
+    /// `RECOMPUTE_INTERVAL_NS`; everything else reads from cache.
+    fn recompute_cache(&mut self, now_ns: u64) {
+        let snapshot = self
+            .state
+            .snapshot_since(now_ns.saturating_sub(WINDOW_NS));
+        let live = stats::live_stats(&snapshot, now_ns, STATS_WINDOW_NS);
+        let drops: u64 = stats::frame_gaps(&snapshot)
+            .iter()
+            .map(|p| p[1] as u64)
+            .sum();
+
+        let fps_pts: Vec<[f64; 2]> = stats::bin_records(&snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
+            if b.is_current && b.width_ns < 100_000_000 {
+                return f64::NAN;
+            }
+            if !b.is_current && b.records.len() < 4 {
+                return f64::NAN;
+            }
+            b.records.len() as f64 * 1_000_000_000.0 / b.width_ns as f64
+        })
+        .into_iter()
+        .filter(|p| p[1].is_finite())
+        .collect();
+
+        let frametime_pts: Vec<[f64; 2]> =
+            stats::bin_records(&snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
+                if b.is_current && b.width_ns < 100_000_000 {
+                    return f64::NAN;
+                }
+                if !b.is_current && b.records.len() < 4 {
+                    return f64::NAN;
+                }
+                let secs = b.width_ns as f64 / 1e9;
+                secs * 1000.0 / b.records.len() as f64
+            })
+            .into_iter()
+            .filter(|p| p[1].is_finite())
+            .collect();
+
+        let (p50_pts, p99_pts, max_pts) = if live.samples == 0 {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            let p50 = stats::bin_records(&snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
+                bin_percentile(&b.records, 0.50)
+            });
+            let p99 = stats::bin_records(&snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
+                bin_percentile(&b.records, 0.99)
+            });
+            let mx = stats::bin_records(&snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
+                b.records
+                    .iter()
+                    .map(|r| r.latency_us as f64)
+                    .fold(0.0, f64::max)
+            });
+            (p50, p99, mx)
+        };
+
+        self.cache = PlotCache {
+            last_now_ns: now_ns,
+            samples: live.samples,
+            live,
+            drops,
+            fps_pts,
+            p50_pts,
+            p99_pts,
+            max_pts,
+            frametime_pts,
+        };
     }
 }
 
@@ -234,11 +328,9 @@ fn connection_pill(ui: &mut egui::Ui, connected: bool) {
 
 // ── Plots ─────────────────────────────────────────────────────────────
 
-fn plots(
+fn plots_cached(
     ctx: &egui::Context,
-    snapshot: &[crate::state::Record],
-    now_ns: u64,
-    samples: usize,
+    cache: &PlotCache,
     fps_y_max: f64,
     frametime_y_max: f64,
     latency_y_max: f64,
@@ -261,46 +353,24 @@ fn plots(
             let plot_h = ((total - 3.0 * CARD_CHROME) / 3.0).max(80.0);
 
             plot_card(ui, "fps", plot_h, |inner| {
-                // Same partial-bin skip as the frame-time plot — a 1-record
-                // bin reports `10 fps` which looks like an enormous drop on
-                // the first plotted point.
-                let pts = stats::bin_records(snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
-                    // Use the bin's actual width — full BIN_NS for sealed
-                    // bins, partial for the current one — so the rightmost
-                    // bin reads true instantaneous fps instead of looking
-                    // like a frame drop. Skip the current bin until it's
-                    // wide enough (≥100 ms) to give a stable reading;
-                    // otherwise a 2-record/20-ms bin yields a 200 fps
-                    // spike that punches through fps_y_max.
-                    if b.is_current && b.width_ns < 100_000_000 {
-                        return f64::NAN;
-                    }
-                    if !b.is_current && b.records.len() < 4 {
-                        return f64::NAN;
-                    }
-                    b.records.len() as f64 * 1_000_000_000.0 / b.width_ns as f64
-                });
-                let pts: Vec<[f64; 2]> = pts.into_iter().filter(|p| p[1].is_finite()).collect();
                 Plot::new("fps_plot")
                     .height(inner.available_height())
                     .legend(Legend::default().background_alpha(0.0))
                     .allow_zoom(false)
                     .allow_drag(false)
                     .allow_scroll(false)
+                    .allow_boxed_zoom(false)
+                    .auto_bounds(Vec2b::FALSE)
                     .show_x(false)
                     .show_y(true)
                     .show(inner, |plot_ui| {
-                        // Hard-pin bounds every frame. The builder-side
-                        // `include_x` gets overridden by egui_plot's
-                        // persistent bound state once the user (or auto-fit)
-                        // touches it — this is the only API that wins.
                         plot_ui.set_plot_bounds(PlotBounds::from_min_max(
                             [-60.0, 0.0],
                             [0.0, fps_y_max],
                         ));
                         plot_ui.set_auto_bounds(Vec2b::FALSE);
                         plot_ui.line(
-                            Line::new(PlotPoints::from(pts))
+                            Line::new(PlotPoints::from(cache.fps_pts.clone()))
                                 .color(theme::LINE_FPS)
                                 .width(2.0)
                                 .name("fps"),
@@ -309,22 +379,10 @@ fn plots(
             });
 
             plot_card(ui, "click-to-photon (µs)", plot_h, |inner| {
-                if samples == 0 {
+                if cache.samples == 0 {
                     no_latency_hint(inner);
                     return;
                 }
-                let p50_points = stats::bin_records(snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
-                    bin_percentile(&b.records, 0.50)
-                });
-                let p99_points = stats::bin_records(snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
-                    bin_percentile(&b.records, 0.99)
-                });
-                let max_points = stats::bin_records(snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
-                    b.records
-                        .iter()
-                        .map(|r| r.latency_us as f64)
-                        .fold(0.0, f64::max)
-                });
                 Plot::new("latency_plot")
                     .height(inner.available_height())
                     .legend(Legend::default().background_alpha(0.0))
@@ -340,19 +398,19 @@ fn plots(
                         ));
                         plot_ui.set_auto_bounds(Vec2b::FALSE);
                         plot_ui.line(
-                            Line::new(PlotPoints::from(p50_points))
+                            Line::new(PlotPoints::from(cache.p50_pts.clone()))
                                 .color(theme::LINE_P50)
                                 .width(1.5)
                                 .name("p50"),
                         );
                         plot_ui.line(
-                            Line::new(PlotPoints::from(p99_points))
+                            Line::new(PlotPoints::from(cache.p99_pts.clone()))
                                 .color(theme::LINE_P99)
                                 .width(1.5)
                                 .name("p99"),
                         );
                         plot_ui.line(
-                            Line::new(PlotPoints::from(max_points))
+                            Line::new(PlotPoints::from(cache.max_pts.clone()))
                                 .color(theme::LINE_MAX)
                                 .width(1.2)
                                 .name("max"),
@@ -361,24 +419,6 @@ fn plots(
             });
 
             plot_card(ui, "frame-time (ms)", plot_h, |inner| {
-                // Same trick as fps: use the bin's actual width so the
-                // current bin reads `width_ms / count` instead of the
-                // full BIN_NS denominator.
-                let pts = stats::bin_records(snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
-                    // Same as the fps closure — skip the current bin until
-                    // it's wide enough that the partial-width reading is
-                    // stable, otherwise a 2-record/20-ms bin yields a
-                    // ~10 ms frame-time spike off the top of the plot.
-                    if b.is_current && b.width_ns < 100_000_000 {
-                        return f64::NAN;
-                    }
-                    if !b.is_current && b.records.len() < 4 {
-                        return f64::NAN;
-                    }
-                    let secs = b.width_ns as f64 / 1e9;
-                    secs * 1000.0 / b.records.len() as f64
-                });
-                let pts: Vec<[f64; 2]> = pts.into_iter().filter(|p| p[1].is_finite()).collect();
                 Plot::new("frametime_plot")
                     .height(inner.available_height())
                     .legend(Legend::default().background_alpha(0.0))
@@ -394,7 +434,7 @@ fn plots(
                         ));
                         plot_ui.set_auto_bounds(Vec2b::FALSE);
                         plot_ui.line(
-                            Line::new(PlotPoints::from(pts))
+                            Line::new(PlotPoints::from(cache.frametime_pts.clone()))
                                 .color(theme::LINE_FRAMETIME)
                                 .width(2.0)
                                 .name("frame-time"),
