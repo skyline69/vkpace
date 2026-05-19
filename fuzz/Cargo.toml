@@ -1,0 +1,30 @@
+[package]
+name = "vkpace-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.vkpace]
+path = ".."
+features = ["fuzz"]
+
+# cargo-fuzz expects each target as its own [[bin]] with `test = false`.
+[[bin]]
+name = "pnext_find"
+path = "fuzz_targets/pnext_find.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+bench = false

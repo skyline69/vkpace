@@ -67,6 +67,10 @@ pub struct FrameRecord {
     pub host_ns: u64,
     pub frame_index: u64,
     pub queue_id: u64,
+    /// KHR present_id, 0 if app didn't supply one.
+    pub present_id: u64,
+    /// Most recent observed click-to-photon (µs), 0 if not available yet.
+    pub latency_us: u64,
 }
 
 struct SocketShared {
@@ -87,7 +91,11 @@ pub struct Telemetry {
 }
 
 impl Telemetry {
-    pub fn new(socket_path: Option<String>, stats_interval_s: u64) -> Self {
+    pub fn new(
+        socket_path: Option<String>,
+        stats_interval_s: u64,
+        prom_path: Option<std::path::PathBuf>,
+    ) -> Self {
         let socket = socket_path.map(|p| {
             Arc::new(SocketShared {
                 ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
@@ -122,7 +130,9 @@ impl Telemetry {
             Some(
                 thread::Builder::new()
                     .name("vkpace-stats".into())
-                    .spawn(move || run_stats(counters, stop, wake, sources, stats_interval_s))
+                    .spawn(move || {
+                        run_stats(counters, stop, wake, sources, prom_path, stats_interval_s)
+                    })
                     .expect("spawn stats"),
             )
         } else {
@@ -144,6 +154,13 @@ impl Telemetry {
     /// on the next stats tick — no explicit unregister needed.
     pub fn register_latency_source(&self, src: Weak<dyn LatencySource>) {
         self.latency_sources.lock().push(src);
+    }
+
+    /// Fast no-op when no socket consumer is configured — avoids any work
+    /// in the caller (Frame timestamps, etc.) when telemetry is off.
+    #[inline]
+    pub fn socket_enabled(&self) -> bool {
+        self.socket.is_some()
     }
 
     pub fn push_record(&self, rec: FrameRecord) {
@@ -183,6 +200,7 @@ fn run_stats(
     stop: Arc<AtomicBool>,
     wake: Arc<(Mutex<()>, Condvar)>,
     sources: Arc<Mutex<Vec<Weak<dyn LatencySource>>>>,
+    prom_path: Option<std::path::PathBuf>,
     interval_s: u64,
 ) {
     let interval = std::time::Duration::from_secs(interval_s);
@@ -218,14 +236,15 @@ fn run_stats(
             });
         }
         let (p50_us, p99_us) = percentile_p50_p99(&mut scratch);
-        if !scratch.is_empty() {
+        let sample_count = scratch.len();
+        if sample_count > 0 {
             tracing::info!(
                 frames,
                 submits,
                 injections,
                 acquires,
                 recent_fps = fps,
-                latency_samples = scratch.len(),
+                latency_samples = sample_count,
                 latency_p50_us = p50_us,
                 latency_p99_us = p99_us,
                 "telemetry snapshot"
@@ -240,7 +259,58 @@ fn run_stats(
                 "telemetry snapshot"
             );
         }
+
+        if let Some(p) = prom_path.as_deref()
+            && let Err(e) = write_prom_textfile(
+                p,
+                frames,
+                submits,
+                injections,
+                acquires,
+                fps,
+                p50_us,
+                p99_us,
+                sample_count,
+            )
+        {
+            tracing::warn!(?e, path = %p.display(), "prom textfile write failed");
+        }
     }
+}
+
+/// Atomic Prometheus textfile write (tmp + rename) so scrapers never see
+/// a half-written file. Format matches node_exporter's textfile collector.
+#[allow(clippy::too_many_arguments)]
+fn write_prom_textfile(
+    path: &std::path::Path,
+    frames: u64,
+    submits: u64,
+    injections: u64,
+    acquires: u64,
+    fps: f64,
+    p50_us: u64,
+    p99_us: u64,
+    samples: usize,
+) -> std::io::Result<()> {
+    use std::fmt::Write as _;
+    let pid = std::process::id();
+    let mut body = String::with_capacity(512);
+    let _ = writeln!(body, "# HELP vkpace_frames_total Frames presented");
+    let _ = writeln!(body, "# TYPE vkpace_frames_total counter");
+    let _ = writeln!(body, "vkpace_frames_total{{pid=\"{pid}\"}} {frames}");
+    let _ = writeln!(body, "vkpace_submits_total{{pid=\"{pid}\"}} {submits}");
+    let _ = writeln!(
+        body,
+        "vkpace_injections_total{{pid=\"{pid}\"}} {injections}"
+    );
+    let _ = writeln!(body, "vkpace_acquires_total{{pid=\"{pid}\"}} {acquires}");
+    let _ = writeln!(body, "vkpace_recent_fps{{pid=\"{pid}\"}} {fps:.3}");
+    let _ = writeln!(body, "vkpace_latency_us_p50{{pid=\"{pid}\"}} {p50_us}");
+    let _ = writeln!(body, "vkpace_latency_us_p99{{pid=\"{pid}\"}} {p99_us}");
+    let _ = writeln!(body, "vkpace_latency_samples{{pid=\"{pid}\"}} {samples}");
+    let tmp = path.with_extension("prom.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(tmp, path)
 }
 
 /// In-place p50/p99. Caller's vec is reused as scratch — sorted on return.
@@ -310,8 +380,8 @@ fn serve_client(shared: &Arc<SocketShared>, conn: &mut std::os::unix::net::UnixS
             use std::fmt::Write as _;
             let _ = writeln!(
                 buf,
-                r#"{{"ts":{},"frame":{},"queue":"0x{:x}"}}"#,
-                rec.host_ns, rec.frame_index, rec.queue_id
+                r#"{{"ts":{},"frame":{},"queue":"0x{:x}","pid":{},"latency_us":{}}}"#,
+                rec.host_ns, rec.frame_index, rec.queue_id, rec.present_id, rec.latency_us
             );
             if conn.write_all(buf.as_bytes()).is_err() {
                 return;

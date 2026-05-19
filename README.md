@@ -16,6 +16,15 @@ cargo build --release
 Produces `target/release/libVkLayer_VKPACE_reduce_latency.so` and a matching
 manifest JSON with an absolute `library_path`.
 
+For a binary that runs on any x86-64-v3 box (Haswell or newer) — useful
+when distributing builds — use the bundled alias:
+
+```
+cargo portable
+```
+
+Output lands in `target/release-portable/`.
+
 ## Use it without installing
 
 Set Steam launch options on the game you want to test:

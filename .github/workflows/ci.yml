@@ -67,3 +67,31 @@ jobs:
           cargo +nightly miri test timestamp_pool::tests
           cargo +nightly miri test config::tests
           cargo +nightly miri test delay_controller::tests
+
+  # Real loader smoke test: load the cdylib through the Vulkan loader
+  # against a Mesa software ICD (lavapipe) and run a few `vkcube`-equivalent
+  # frames. Catches loader-side regressions (handshake, dispatch chain,
+  # extension fallback) that the unit tests can't see.
+  lavapipe-smoke:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install lavapipe + vulkaninfo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools libvulkan1
+      - name: Build layer
+        run: cargo build --release
+      - name: vulkaninfo through layer (lavapipe ICD)
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          VK_ADD_LAYER_PATH: ${{ github.workspace }}/target/release
+          VK_LOADER_LAYERS_ENABLE: VK_LAYER_VKPACE_reduce_latency
+          VKPACE_LOG: info
+          VKPACE_STATS_INTERVAL: 1
+        run: |
+          vulkaninfo --summary | tee vulkaninfo.out
+          grep -q "lavapipe\|llvmpipe" vulkaninfo.out

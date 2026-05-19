@@ -256,8 +256,10 @@ fn locate_toml() -> Option<PathBuf> {
 /// ```
 ///
 /// Anything else is ignored with a warning. We deliberately don't pull in
-/// `toml`/`serde` — keeping the dep tree small matters for a layer that may
-/// be loaded into every Vulkan process on the system.
+/// `toml`/`basic-toml`/`serde` — for a layer loaded into every Vulkan
+/// process on the system, even a "minimal" TOML crate's ~5 transitive
+/// deps and proc-macro hit aren't justified by the parsing complexity here.
+/// The schema is closed; this stays simple as long as it does.
 fn load_toml() -> Option<Vec<AppOverride>> {
     let path = locate_toml()?;
     let contents = match fs::read_to_string(&path) {
@@ -335,6 +337,12 @@ fn strip_quotes(s: &str) -> &str {
     } else {
         s
     }
+}
+
+/// Fuzz-only re-export of [`load_toml`]. Gated by the `fuzz` Cargo feature.
+#[cfg(feature = "fuzz")]
+pub fn __fuzz_load_toml() -> Option<Vec<AppOverride>> {
+    load_toml()
 }
 
 fn parse_bool(s: &str) -> Option<bool> {

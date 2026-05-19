@@ -11,8 +11,10 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use crate::amd_anti_lag::{AntiLagDataAMD, AntiLagModeAMD, AntiLagStageAMD};
+use crate::clock::DeviceClock;
 use crate::delay_controller::DelayController;
 use crate::device::DeviceContext;
+use crate::strategy::low_latency2::MarkerHistory;
 use crate::strategy::{DeviceStrategy, QueueStrategy, extend_or_init};
 use crate::submission_span::SubmissionSpan;
 use crate::timestamp_pool::Handle;
@@ -26,11 +28,20 @@ struct State {
 pub struct AntiLagDeviceStrategy {
     device: Arc<DeviceContext>,
     state: Mutex<State>,
+    /// Synthetic marker history so the telemetry stats worker can derive
+    /// p50/p99 click-to-photon for AntiLag too. Keys frames by the
+    /// app-supplied AntiLag frame_index (which doubles as our pid).
+    markers: Arc<MarkerHistory>,
 }
 
 impl AntiLagDeviceStrategy {
     pub fn new(device: Arc<DeviceContext>) -> Self {
         let decoupled = device.instance.is_simulation_decoupled;
+        let markers = Arc::new(MarkerHistory::new());
+        // Register synthetic markers with global telemetry. Weak so
+        // teardown auto-evicts.
+        let src: Arc<dyn crate::telemetry::LatencySource> = markers.clone();
+        crate::TELEMETRY.register_latency_source(Arc::downgrade(&src));
         Self {
             device,
             state: Mutex::new(State {
@@ -38,6 +49,7 @@ impl AntiLagDeviceStrategy {
                 enabled: false,
                 delay_controller: DelayController::new(decoupled),
             }),
+            markers,
         }
     }
 
@@ -71,10 +83,20 @@ impl AntiLagDeviceStrategy {
             match pres.stage {
                 AntiLagStageAMD::PRESENT => {
                     st.frame_index = None;
+                    // PRESENT marker carries display-side timing; record
+                    // both PRESENT_END and the layer-measured "display
+                    // actual" using current host-now (we don't have a
+                    // post-scanout source on the AntiLag path).
+                    self.markers
+                        .record(pres.frame_index, vk::LatencyMarkerNV::PRESENT_END);
+                    self.markers
+                        .record_present_actual(pres.frame_index, DeviceClock::now());
                     return;
                 }
                 AntiLagStageAMD::INPUT => {
                     st.frame_index = Some(pres.frame_index);
+                    self.markers
+                        .record(pres.frame_index, vk::LatencyMarkerNV::INPUT_SAMPLE);
                 }
                 _ => {
                     tracing::trace!(stage = pres.stage.0, "AntiLag: unknown stage");

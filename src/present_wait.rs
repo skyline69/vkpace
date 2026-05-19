@@ -136,6 +136,18 @@ struct GoogleInner {
     pending: Mutex<FxHashMap<vk::SwapchainKHR, VecDeque<u64>>>,
     wake: (Mutex<()>, Condvar),
     stop: AtomicBool,
+    /// Clock domain of `actual_present_time`. Validated on first sample;
+    /// `Unknown` → fall back to host-monotonic-at-poll-return (lossy but
+    /// safe). The Vulkan spec leaves the domain implementation-defined; in
+    /// practice every Linux driver returns CLOCK_MONOTONIC ns.
+    domain: parking_lot::Mutex<GoogleClockDomain>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GoogleClockDomain {
+    Unvalidated,
+    Monotonic,
+    Unknown,
 }
 
 pub struct GoogleTimingWorker {
@@ -158,6 +170,7 @@ impl GoogleTimingWorker {
             pending: Mutex::new(FxHashMap::default()),
             wake: (Mutex::new(()), Condvar::new()),
             stop: AtomicBool::new(false),
+            domain: parking_lot::Mutex::new(GoogleClockDomain::Unvalidated),
         });
         let handle = {
             let inner = inner.clone();
@@ -199,6 +212,21 @@ impl Drop for GoogleTimingWorker {
     }
 }
 
+/// Sanity-check a candidate `actual_present_time` against the current host
+/// monotonic clock. Values within ±5 s are assumed to be CLOCK_MONOTONIC ns
+/// (the de-facto Linux convention); anything wilder probably means the
+/// driver picked a device-clock or epoch-relative domain, and we'd rather
+/// drop the sample than feed garbage into the latency overlay.
+fn classify_google_domain(sample_ns: u64, now_ns: u64) -> GoogleClockDomain {
+    const ACCEPT_SKEW_NS: i128 = 5_000_000_000;
+    let skew = sample_ns as i128 - now_ns as i128;
+    if skew.abs() <= ACCEPT_SKEW_NS {
+        GoogleClockDomain::Monotonic
+    } else {
+        GoogleClockDomain::Unknown
+    }
+}
+
 fn run_google(inner: Arc<GoogleInner>) {
     let poll = inner
         .fns
@@ -207,13 +235,15 @@ fn run_google(inner: Arc<GoogleInner>) {
 
     // Reused per poll. Caps avoid spec-permitted unbounded responses.
     let mut scratch: Vec<vk::PastPresentationTimingGOOGLE> = Vec::with_capacity(32);
+    let mut swapchain_scratch: Vec<vk::SwapchainKHR> = Vec::with_capacity(4);
 
     while !inner.stop.load(Ordering::Acquire) {
-        // Snapshot swapchain list to avoid holding the pending lock across
-        // FFI. Keys only — values stay under the mutex.
-        let swapchains: Vec<vk::SwapchainKHR> = inner.pending.lock().keys().copied().collect();
+        // Snapshot swapchain list into a reused buffer (avoid per-tick alloc).
+        swapchain_scratch.clear();
+        swapchain_scratch.extend(inner.pending.lock().keys().copied());
 
-        for sw in swapchains {
+        for sw in &swapchain_scratch {
+            let sw = *sw;
             let mut count: u32 = 0;
             let r = unsafe { poll(inner.device, sw, &mut count, std::ptr::null_mut()) };
             if r != vk::Result::SUCCESS || count == 0 {
@@ -235,18 +265,42 @@ fn run_google(inner: Arc<GoogleInner>) {
             let Some(fifo) = pending.get_mut(&sw) else {
                 continue;
             };
+            // One-time domain validation against the first non-zero sample.
+            {
+                let mut domain = inner.domain.lock();
+                if *domain == GoogleClockDomain::Unvalidated
+                    && let Some(sample) = scratch.iter().find(|t| t.actual_present_time != 0)
+                {
+                    *domain = classify_google_domain(sample.actual_present_time, now_ns);
+                    match *domain {
+                        GoogleClockDomain::Monotonic => {
+                            tracing::info!(
+                                "GOOGLE_display_timing: actual_present_time domain looks like CLOCK_MONOTONIC"
+                            );
+                        }
+                        GoogleClockDomain::Unknown => {
+                            tracing::warn!(
+                                sample = sample.actual_present_time,
+                                now = now_ns,
+                                "GOOGLE_display_timing: actual_present_time domain skewed; recording host-now as fallback"
+                            );
+                        }
+                        GoogleClockDomain::Unvalidated => unreachable!(),
+                    }
+                }
+            }
+            let domain = *inner.domain.lock();
             for timing in &scratch {
                 let Some(pid) = fifo.pop_front() else {
                     break;
                 };
-                // `actual_present_time` is in the driver's monotonic clock
-                // domain. Linux Mesa returns CLOCK_MONOTONIC, which matches
-                // DeviceClock::now() — store it directly. Fall back to
-                // "now" if the field is zero (driver didn't fill it).
-                let host_ns = if timing.actual_present_time != 0 {
-                    timing.actual_present_time
-                } else {
-                    now_ns
+                // Pick host-ns according to the validated domain. We never
+                // hand a wildly-skewed timestamp to the marker history.
+                let host_ns = match domain {
+                    GoogleClockDomain::Monotonic if timing.actual_present_time != 0 => {
+                        timing.actual_present_time
+                    }
+                    _ => now_ns,
                 };
                 inner.markers.record_present_actual(pid, host_ns);
             }

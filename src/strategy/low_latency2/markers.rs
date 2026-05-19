@@ -30,7 +30,15 @@ struct FrameMarkers {
     render_submit_start_us: u64,
     render_submit_end_us: u64,
     present_start_us: u64,
+    /// App-set `PRESENT_END` marker — per spec the moment the app finished
+    /// issuing the present call. Kept verbatim so the Reflex report stays
+    /// faithful to what the application reported.
     present_end_us: u64,
+    /// Layer-measured actual display-side scanout time (host monotonic µs),
+    /// sourced from `vkWaitForPresentKHR` or `VK_GOOGLE_display_timing`.
+    /// Used for click-to-photon telemetry and exported in the Reflex report
+    /// only when the app didn't supply its own `PRESENT_END` for the frame.
+    display_actual_us: u64,
     gpu_render_start_us: u64,
     gpu_render_end_us: u64,
 }
@@ -132,8 +140,32 @@ impl MarkerHistory {
         let mut inner = self.inner.lock();
         if let Some(abs) = inner.by_present_id.get(&present_id).copied() {
             let slot = (abs - inner.head_index) as usize;
-            inner.frames[slot].present_end_us = actual_host_ns / 1_000;
+            // Distinct field so we never clobber the app-set PRESENT_END
+            // marker. The fill() path falls back to display_actual_us only
+            // when present_end_us is empty.
+            inner.frames[slot].display_actual_us = actual_host_ns / 1_000;
         }
+    }
+
+    /// Last frame's click-to-photon (µs) — newest frame with both an
+    /// input-sample and a display-side endpoint. 0 if not yet measurable.
+    /// Cheap snapshot for the per-present telemetry record.
+    pub fn latest_latency_us(&self) -> u64 {
+        let inner = self.inner.lock();
+        for f in inner.frames.iter().rev() {
+            if f.input_sample_us == 0 {
+                continue;
+            }
+            let end = if f.display_actual_us != 0 {
+                f.display_actual_us
+            } else {
+                f.present_end_us
+            };
+            if end > f.input_sample_us {
+                return end - f.input_sample_us;
+            }
+        }
+        0
     }
 
     /// Fill a caller-provided `VkGetLatencyMarkerInfoNV` buffer with the most
@@ -152,6 +184,13 @@ impl MarkerHistory {
         let to_write = max.min(inner.frames.len());
         for (i, src) in inner.frames.iter().rev().take(to_write).enumerate() {
             let dst = unsafe { &mut *timings.p_timings.add(i) };
+            // Prefer app's PRESENT_END marker; only fall back to layer's
+            // measured display-actual when the app didn't supply one.
+            let present_end = if src.present_end_us != 0 {
+                src.present_end_us
+            } else {
+                src.display_actual_us
+            };
             *dst = vk::LatencyTimingsFrameReportNV::default()
                 .present_id(src.present_id)
                 .input_sample_time_us(src.input_sample_us)
@@ -160,7 +199,7 @@ impl MarkerHistory {
                 .render_submit_start_time_us(src.render_submit_start_us)
                 .render_submit_end_time_us(src.render_submit_end_us)
                 .present_start_time_us(src.present_start_us)
-                .present_end_time_us(src.present_end_us)
+                .present_end_time_us(present_end)
                 .gpu_render_start_time_us(src.gpu_render_start_us)
                 .gpu_render_end_time_us(src.gpu_render_end_us);
         }
@@ -176,14 +215,24 @@ impl Default for MarkerHistory {
 
 impl crate::telemetry::LatencySource for MarkerHistory {
     /// Append click-to-photon samples (µs) for every frame in the window
-    /// that has both an input sample and a present-end timestamp. Frames
-    /// missing either marker are skipped — the layer can't compute a
-    /// meaningful latency without both ends.
+    /// that has both an input sample and a present-end timestamp. We prefer
+    /// the layer-measured display-actual time when available (that's the
+    /// real scanout moment); fall back to the app's PRESENT_END marker if
+    /// the present-wait worker didn't catch this frame. Frames missing
+    /// either endpoint are skipped.
     fn latencies_us(&self, out: &mut Vec<u64>) {
         let inner = self.inner.lock();
         for f in inner.frames.iter() {
-            if f.input_sample_us != 0 && f.present_end_us > f.input_sample_us {
-                out.push(f.present_end_us - f.input_sample_us);
+            if f.input_sample_us == 0 {
+                continue;
+            }
+            let end = if f.display_actual_us != 0 {
+                f.display_actual_us
+            } else {
+                f.present_end_us
+            };
+            if end > f.input_sample_us {
+                out.push(end - f.input_sample_us);
             }
         }
     }
@@ -280,5 +329,41 @@ mod tests {
         let mut out = Vec::new();
         h.latencies_us(&mut out);
         assert_eq!(out, vec![400]);
+    }
+
+    #[test]
+    fn record_present_actual_does_not_clobber_app_present_end() {
+        let h = MarkerHistory::new();
+        h.record(7, vk::LatencyMarkerNV::INPUT_SAMPLE);
+        // App-set marker.
+        {
+            let mut inner = h.inner.lock();
+            inner.frames[0].input_sample_us = 100;
+            inner.frames[0].present_end_us = 800;
+        }
+        // Layer worker reports a different (later) actual display time.
+        h.record_present_actual(7, 1_500_000); // 1500 µs after conversion
+        let inner = h.inner.lock();
+        // App marker preserved verbatim.
+        assert_eq!(inner.frames[0].present_end_us, 800);
+        // Layer-measured field carries the new value.
+        assert_eq!(inner.frames[0].display_actual_us, 1500);
+    }
+
+    #[test]
+    fn latency_source_prefers_display_actual_over_app_present_end() {
+        let h = MarkerHistory::new();
+        h.record(9, vk::LatencyMarkerNV::INPUT_SAMPLE);
+        {
+            let mut inner = h.inner.lock();
+            inner.frames[0].input_sample_us = 100;
+            inner.frames[0].present_end_us = 200;
+            inner.frames[0].display_actual_us = 1_000;
+        }
+        let mut out = Vec::new();
+        h.latencies_us(&mut out);
+        // 1000 - 100 wins over 200 - 100 because display_actual reflects
+        // real scanout time.
+        assert_eq!(out, vec![900]);
     }
 }

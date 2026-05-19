@@ -26,3 +26,9 @@ rustflags = [
 
 [build]
 # No global rustflags override here — keep per-target so cross-builds work.
+
+# Shortcut for the README's portable build. Drops `target-cpu=native` and
+# falls back to `x86-64-v3` (Haswell baseline — covers anything from 2013).
+# Invoke as `cargo portable`.
+[alias]
+portable = "rustc --release --profile release-portable -- -C target-cpu=x86-64-v3"

@@ -8,7 +8,16 @@ description = "vkpace — Vulkan implicit layer that reduces input latency by sp
 
 [lib]
 name = "VkLayer_VKPACE_reduce_latency"
-crate-type = ["cdylib"]
+# `rlib` alongside `cdylib` lets the fuzz subcrate link the layer normally
+# (the Vulkan loader still consumes only the cdylib output).
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Re-exports a handful of internals (TOML parser, pNext walker) under
+# `vkpace::__fuzz_api`. Enabled by the fuzz subcrate; left off for the
+# shipped layer so the extra surface stays unexposed.
+fuzz = []
 
 [dependencies]
 ash = { version = "0.38", default-features = false }

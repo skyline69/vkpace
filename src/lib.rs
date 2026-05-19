@@ -14,6 +14,8 @@
 // Every raw deref / FFI call must be in an explicit `unsafe {}` block, even
 // inside an `unsafe fn`. Catches accidental unsafe-creep into helper code.
 #![deny(unsafe_op_in_unsafe_fn)]
+// No dead code lurking. Anything unused gets removed, not allowed.
+#![deny(dead_code)]
 
 mod amd_anti_lag;
 mod catch;
@@ -22,6 +24,7 @@ mod config;
 mod delay_controller;
 mod device;
 mod dispatch;
+mod entrypoints;
 mod instance;
 mod physical_device;
 mod pnext;
@@ -34,10 +37,52 @@ mod telemetry;
 mod timestamp_pool;
 mod vk_layer;
 
+/// Narrow re-export surface for the `fuzz/` subcrate. Gated by the `fuzz`
+/// Cargo feature so the shipped layer doesn't expose internals. Never
+/// import this from production code.
+#[cfg(feature = "fuzz")]
+pub mod __fuzz_api {
+    use std::ffi::c_void;
+
+    /// Fuzz harness for `pnext::find`. Walks an arbitrary byte-shaped
+    /// pNext chain — the harness fabricates a chain of `BaseHeader`s from
+    /// the input bytes.
+    ///
+    /// # Safety
+    /// `head` must outlive the call. Provided by the harness.
+    pub unsafe fn pnext_find_any(head: *const c_void) -> bool {
+        // Just exercise the walker; verifying we don't deref past the
+        // chain or hit UB is the libfuzzer-side goal.
+        unsafe {
+            for (_, _) in crate::pnext::PNextIter::new(head) {
+                std::hint::black_box(());
+            }
+        }
+        true
+    }
+
+    /// Fuzz harness for the TOML loader. Writes `input` to a tempfile,
+    /// sets `VKPACE_CONFIG`, calls `load_toml`. Detects panics / OOMs
+    /// on any byte input.
+    pub fn config_toml_load(input: &str) {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("vkpace-fuzz-{}.toml", std::process::id()));
+        if std::fs::write(&path, input).is_err() {
+            return;
+        }
+        // Safety: env access is process-global but fuzz binaries run
+        // single-threaded.
+        unsafe {
+            std::env::set_var("VKPACE_CONFIG", &path);
+        }
+        let _ = crate::config::__fuzz_load_toml();
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 use ash::vk;
 use once_cell::sync::Lazy;
 use rustc_hash::FxHashMap;
-use smallvec::SmallVec;
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::Arc;
 
@@ -57,7 +102,10 @@ pub(crate) static TELEMETRY: Lazy<telemetry::Telemetry> = Lazy::new(|| {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
-    telemetry::Telemetry::new(socket, stats_interval)
+    let prom_path = std::env::var("VKPACE_PROM_PATH")
+        .ok()
+        .map(std::path::PathBuf::from);
+    telemetry::Telemetry::new(socket, stats_interval, prom_path)
 });
 
 fn init_tracing_once() {
@@ -466,30 +514,6 @@ unsafe extern "system" fn get_device_queue2(
     })
 }
 
-/// Whether the given submit should be wrapped with timestamp CBs.
-///
-/// - LL2 (`expose_reflex`): inject every graphics submit. The strategy
-///   keys submission spans by the optional `VkLatencySubmissionPresentIdNV`
-///   (defaulting to 0 when absent); present-side matches by
-///   `VkPresentIdKHR`. We can't know which submit "matters" until present,
-///   so we keep them all. Matches the C++ reference.
-/// - AntiLag: only while AntiLag tracking is active (input→present window).
-///   In the dormant window we'd just do work the strategy throws away.
-unsafe fn should_inject_for_submit(qctx: &QueueContext, _p_next: *const c_void) -> bool {
-    if !qctx.should_inject_timestamps() {
-        return false;
-    }
-    if qctx.device.instance.config.expose_reflex {
-        true
-    } else {
-        qctx.device
-            .strategy
-            .get()
-            .and_then(|s| s.as_anti_lag())
-            .is_some_and(|s| s.should_track_submissions())
-    }
-}
-
 fn register_queue(device: Arc<DeviceContext>, queue: vk::Queue, family: u32) {
     let key = registry::key(queue);
     if registry::QUEUES.contains_key(&key) {
@@ -502,470 +526,6 @@ fn register_queue(device: Arc<DeviceContext>, queue: vk::Queue, family: u32) {
     tracing::debug!(?queue, family, "register queue");
     registry::QUEUES.insert(key, qctx.clone());
     device.queues.insert(key, qctx);
-}
-
-// ─── Submit / present ──────────────────────────────────────────────────────
-
-// Thread-local fallback storage for the QueueSubmit injection path. The
-// SmallVec inline capacities cover the typical 1-4-submit / ≤8-CB hot path
-// without heap allocation; for the (rare) spill case we hand the spilled
-// `Vec` back to the thread-local arena instead of dropping it, so the next
-// call on the same thread re-uses the buffer.
-mod submit_arena {
-    use ash::vk;
-    use std::cell::RefCell;
-
-    thread_local! {
-        static SUBMIT1_CBS: RefCell<Vec<Vec<vk::CommandBuffer>>> = const { RefCell::new(Vec::new()) };
-        static SUBMIT2_CBS: RefCell<Vec<Vec<vk::CommandBufferSubmitInfo<'static>>>> =
-            const { RefCell::new(Vec::new()) };
-    }
-
-    pub fn take_submit1() -> Vec<vk::CommandBuffer> {
-        SUBMIT1_CBS.with(|c| c.borrow_mut().pop().unwrap_or_default())
-    }
-
-    pub fn give_submit1(mut v: Vec<vk::CommandBuffer>) {
-        v.clear();
-        SUBMIT1_CBS.with(|c| c.borrow_mut().push(v));
-    }
-
-    pub fn take_submit2() -> Vec<vk::CommandBufferSubmitInfo<'static>> {
-        SUBMIT2_CBS.with(|c| c.borrow_mut().pop().unwrap_or_default())
-    }
-
-    pub fn give_submit2(mut v: Vec<vk::CommandBufferSubmitInfo<'static>>) {
-        v.clear();
-        SUBMIT2_CBS.with(|c| c.borrow_mut().push(v));
-    }
-}
-
-unsafe extern "system" fn queue_submit(
-    queue: vk::Queue,
-    submit_count: u32,
-    p_submits: *const vk::SubmitInfo<'_>,
-    fence: vk::Fence,
-) -> vk::Result {
-    crate::catch::vk_result(|| {
-        let Some(qctx) = registry::QUEUES
-            .get(&registry::key(queue))
-            .map(|r| r.clone())
-        else {
-            return vk::Result::ERROR_INITIALIZATION_FAILED;
-        };
-        let fns = &qctx.device.fns;
-        if submit_count == 0 {
-            return unsafe { (fns.queue_submit)(queue, submit_count, p_submits, fence) };
-        }
-        let submits = unsafe { std::slice::from_raw_parts(p_submits, submit_count as usize) };
-
-        // Per-submit decision. Skip injection on submits the strategy
-        // wouldn't track anyway. Fast-path: if NO submit needs injection,
-        // forward the caller's array verbatim — zero allocations.
-        let inject_mask: SmallVec<[bool; 4]> = submits
-            .iter()
-            .map(|s| unsafe { should_inject_for_submit(&qctx, s.p_next) })
-            .collect();
-        if inject_mask.iter().all(|b| !b) {
-            let r = unsafe { (fns.queue_submit)(queue, submit_count, p_submits, fence) };
-            TELEMETRY.counters.record_submit_call(submit_count, 0);
-            return r;
-        }
-
-        let mut handles: SmallVec<[Option<Arc<crate::timestamp_pool::Handle>>; 4]> =
-            SmallVec::with_capacity(submits.len());
-        let mut all_cbs: SmallVec<[Vec<vk::CommandBuffer>; 4]> =
-            SmallVec::with_capacity(submits.len());
-        let mut next_submits: SmallVec<[vk::SubmitInfo<'_>; 4]> =
-            SmallVec::with_capacity(submits.len());
-
-        for (submit, &inject) in submits.iter().zip(inject_mask.iter()) {
-            if !inject {
-                next_submits.push(*submit);
-                handles.push(None);
-                continue;
-            }
-            let Some(handle) = qctx.timestamp_pool.acquire() else {
-                return unsafe { (fns.queue_submit)(queue, submit_count, p_submits, fence) };
-            };
-            let mut cbs = submit_arena::take_submit1();
-            cbs.reserve(submit.command_buffer_count as usize + 2);
-            cbs.push(handle.start_buffer());
-            cbs.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(
-                    submit.p_command_buffers,
-                    submit.command_buffer_count as usize,
-                )
-            });
-            cbs.push(handle.end_buffer());
-            let mut next = *submit;
-            next.command_buffer_count = cbs.len() as u32;
-            next.p_command_buffers = cbs.as_ptr();
-            all_cbs.push(cbs);
-            next_submits.push(next);
-            handles.push(Some(handle));
-        }
-
-        let r = unsafe {
-            (fns.queue_submit)(
-                queue,
-                next_submits.len() as u32,
-                next_submits.as_ptr(),
-                fence,
-            )
-        };
-        for v in all_cbs.drain(..) {
-            submit_arena::give_submit1(v);
-        }
-        if r != vk::Result::SUCCESS {
-            return r;
-        }
-        let mut injected_count = 0u32;
-        for (submit, handle) in submits.iter().zip(handles) {
-            let Some(handle) = handle else { continue };
-            injected_count += 1;
-            handle
-                .was_submitted
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            unsafe { qctx.strategy.notify_submit(submit.p_next, handle) };
-        }
-        TELEMETRY
-            .counters
-            .record_submit_call(submit_count, injected_count);
-        vk::Result::SUCCESS
-    })
-}
-
-unsafe extern "system" fn queue_submit2(
-    queue: vk::Queue,
-    submit_count: u32,
-    p_submits: *const vk::SubmitInfo2<'_>,
-    fence: vk::Fence,
-) -> vk::Result {
-    unsafe { queue_submit2_dispatch(queue, submit_count, p_submits, fence, Submit2Variant::Core) }
-}
-
-unsafe extern "system" fn queue_submit2_khr(
-    queue: vk::Queue,
-    submit_count: u32,
-    p_submits: *const vk::SubmitInfo2<'_>,
-    fence: vk::Fence,
-) -> vk::Result {
-    unsafe { queue_submit2_dispatch(queue, submit_count, p_submits, fence, Submit2Variant::Khr) }
-}
-
-#[derive(Clone, Copy)]
-enum Submit2Variant {
-    Core,
-    Khr,
-}
-
-unsafe fn queue_submit2_dispatch(
-    queue: vk::Queue,
-    submit_count: u32,
-    p_submits: *const vk::SubmitInfo2<'_>,
-    fence: vk::Fence,
-    variant: Submit2Variant,
-) -> vk::Result {
-    crate::catch::vk_result(|| {
-        let Some(qctx) = registry::QUEUES
-            .get(&registry::key(queue))
-            .map(|r| r.clone())
-        else {
-            return vk::Result::ERROR_INITIALIZATION_FAILED;
-        };
-        let fns = &qctx.device.fns;
-        // Dispatch the same variant the caller invoked. Fall back to the
-        // other slot only if the driver didn't expose the requested one —
-        // shouldn't happen in a well-formed loader chain but keeps the
-        // layer from returning INITIALIZATION_FAILED on edge drivers.
-        let submit2 = match variant {
-            Submit2Variant::Core => fns.queue_submit2.or(fns.queue_submit2_khr),
-            Submit2Variant::Khr => fns.queue_submit2_khr.or(fns.queue_submit2),
-        };
-        let Some(submit2) = submit2 else {
-            return vk::Result::ERROR_INITIALIZATION_FAILED;
-        };
-        if submit_count == 0 {
-            return unsafe { submit2(queue, submit_count, p_submits, fence) };
-        }
-        let submits = unsafe { std::slice::from_raw_parts(p_submits, submit_count as usize) };
-
-        let inject_mask: SmallVec<[bool; 4]> = submits
-            .iter()
-            .map(|s| unsafe { should_inject_for_submit(&qctx, s.p_next) })
-            .collect();
-        if inject_mask.iter().all(|b| !b) {
-            let r = unsafe { submit2(queue, submit_count, p_submits, fence) };
-            TELEMETRY.counters.record_submit_call(submit_count, 0);
-            return r;
-        }
-
-        let mut handles: SmallVec<[Option<Arc<crate::timestamp_pool::Handle>>; 4]> =
-            SmallVec::with_capacity(submits.len());
-        let mut all_cbs: SmallVec<[Vec<vk::CommandBufferSubmitInfo<'static>>; 4]> =
-            SmallVec::with_capacity(submits.len());
-        let mut next_submits: SmallVec<[vk::SubmitInfo2<'_>; 4]> =
-            SmallVec::with_capacity(submits.len());
-
-        for (submit, &inject) in submits.iter().zip(inject_mask.iter()) {
-            if !inject {
-                next_submits.push(*submit);
-                handles.push(None);
-                continue;
-            }
-            let Some(handle) = qctx.timestamp_pool.acquire() else {
-                return unsafe { submit2(queue, submit_count, p_submits, fence) };
-            };
-            let start_cb: vk::CommandBufferSubmitInfo<'static> =
-                vk::CommandBufferSubmitInfo::default().command_buffer(handle.start_buffer());
-            let end_cb: vk::CommandBufferSubmitInfo<'static> =
-                vk::CommandBufferSubmitInfo::default().command_buffer(handle.end_buffer());
-
-            let mut cbs = submit_arena::take_submit2();
-            cbs.reserve(submit.command_buffer_info_count as usize + 2);
-            cbs.push(start_cb);
-            let user_slice = unsafe {
-                std::slice::from_raw_parts(
-                    submit.p_command_buffer_infos,
-                    submit.command_buffer_info_count as usize,
-                )
-            };
-            cbs.extend(user_slice.iter().map(|s| {
-                // SAFETY: same struct layout; only widening the lifetime
-                // parameter for arena storage we control.
-                unsafe {
-                    std::mem::transmute::<
-                        vk::CommandBufferSubmitInfo<'_>,
-                        vk::CommandBufferSubmitInfo<'static>,
-                    >(*s)
-                }
-            }));
-            cbs.push(end_cb);
-            let mut next = *submit;
-            next.command_buffer_info_count = cbs.len() as u32;
-            next.p_command_buffer_infos = cbs.as_ptr().cast::<vk::CommandBufferSubmitInfo<'_>>();
-            all_cbs.push(cbs);
-            next_submits.push(next);
-            handles.push(Some(handle));
-        }
-
-        let r = unsafe {
-            submit2(
-                queue,
-                next_submits.len() as u32,
-                next_submits.as_ptr(),
-                fence,
-            )
-        };
-        for v in all_cbs.drain(..) {
-            submit_arena::give_submit2(v);
-        }
-        if r != vk::Result::SUCCESS {
-            return r;
-        }
-        let mut injected_count = 0u32;
-        for (submit, handle) in submits.iter().zip(handles) {
-            let Some(handle) = handle else { continue };
-            injected_count += 1;
-            handle
-                .was_submitted
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            unsafe { qctx.strategy.notify_submit(submit.p_next, handle) };
-        }
-        TELEMETRY
-            .counters
-            .record_submit_call(submit_count, injected_count);
-        vk::Result::SUCCESS
-    })
-}
-
-unsafe extern "system" fn queue_present_khr(
-    queue: vk::Queue,
-    p_present_info: *const vk::PresentInfoKHR<'_>,
-) -> vk::Result {
-    crate::catch::vk_result(|| {
-        let Some(qctx) = registry::QUEUES
-            .get(&registry::key(queue))
-            .map(|r| r.clone())
-        else {
-            return vk::Result::ERROR_INITIALIZATION_FAILED;
-        };
-        let fns = &qctx.device.fns;
-        let Some(present_khr) = fns.queue_present_khr else {
-            return vk::Result::ERROR_INITIALIZATION_FAILED;
-        };
-        let r = unsafe { present_khr(queue, p_present_info) };
-        TELEMETRY.counters.inc_present();
-        TELEMETRY.push_record(telemetry::FrameRecord {
-            host_ns: clock::DeviceClock::now(),
-            frame_index: TELEMETRY
-                .counters
-                .frames
-                .load(std::sync::atomic::Ordering::Relaxed),
-            queue_id: registry::key(queue),
-        });
-
-        if let Some(info) = unsafe { p_present_info.as_ref() } {
-            qctx.strategy.notify_present(info);
-            if let Some(s) = qctx.device.strategy.get().and_then(|s| s.as_low_latency2()) {
-                strategy::low_latency2::forward_present(s, info);
-            }
-            // VRR soft target needs a swapchain handle to query refresh
-            // duration; first present is the earliest point we have one.
-            if info.swapchain_count > 0 {
-                let sw = unsafe { *info.p_swapchains };
-                qctx.device.ensure_vrr_target(sw);
-            }
-            // Enqueue a vkWaitForPresentKHR per (swapchain, present_id) if
-            // the device has a KHR worker, else fall through to the GOOGLE
-            // display-timing worker. Either path records actual display-side
-            // completion time into the marker history.
-            let khr = qctx.device.present_wait.get();
-            let google = qctx.device.google_timing.get();
-            if khr.is_some() || google.is_some() {
-                let present_ids = unsafe {
-                    pnext::find::<vk::PresentIdKHR>(info.p_next, vk::StructureType::PRESENT_ID_KHR)
-                        .and_then(|p| {
-                            let p = &*p;
-                            (!p.p_present_ids.is_null()).then(|| {
-                                std::slice::from_raw_parts(
-                                    p.p_present_ids,
-                                    p.swapchain_count as usize,
-                                )
-                            })
-                        })
-                };
-                for i in 0..info.swapchain_count as usize {
-                    let swapchain = unsafe { *info.p_swapchains.add(i) };
-                    let pid = present_ids.map(|s| s[i]).unwrap_or(0);
-                    if pid == 0 {
-                        continue;
-                    }
-                    if let Some(w) = khr {
-                        w.enqueue(swapchain, pid);
-                    } else if let Some(w) = google {
-                        w.enqueue(swapchain, pid);
-                    }
-                }
-            }
-        }
-        r
-    })
-}
-
-// ─── Swapchain ─────────────────────────────────────────────────────────────
-
-unsafe extern "system" fn create_swapchain_khr(
-    device: vk::Device,
-    p_create_info: *const vk::SwapchainCreateInfoKHR<'_>,
-    p_allocator: *const vk::AllocationCallbacks<'_>,
-    p_swapchain: *mut vk::SwapchainKHR,
-) -> vk::Result {
-    crate::catch::vk_result(|| {
-        let Some(ctx) = registry::DEVICES
-            .get(&registry::key(device))
-            .map(|r| r.clone())
-        else {
-            return vk::Result::ERROR_INITIALIZATION_FAILED;
-        };
-        let Some(create) = ctx.fns.create_swapchain_khr else {
-            return vk::Result::ERROR_INITIALIZATION_FAILED;
-        };
-        let r = unsafe { create(device, p_create_info, p_allocator, p_swapchain) };
-        if r != vk::Result::SUCCESS {
-            return r;
-        }
-        if let (Some(info), Some(s)) = (unsafe { p_create_info.as_ref() }, ctx.strategy.get()) {
-            s.notify_create_swapchain(unsafe { *p_swapchain }, info);
-        }
-        r
-    })
-}
-
-unsafe extern "system" fn acquire_next_image_khr(
-    device: vk::Device,
-    swapchain: vk::SwapchainKHR,
-    timeout: u64,
-    semaphore: vk::Semaphore,
-    fence: vk::Fence,
-    p_image_index: *mut u32,
-) -> vk::Result {
-    crate::catch::vk_result(|| {
-        let Some(ctx) = registry::DEVICES
-            .get(&registry::key(device))
-            .map(|r| r.clone())
-        else {
-            return vk::Result::ERROR_INITIALIZATION_FAILED;
-        };
-        let Some(acquire) = ctx.fns.acquire_next_image_khr else {
-            return vk::Result::ERROR_INITIALIZATION_FAILED;
-        };
-        let start_ns = clock::DeviceClock::now();
-        let r = unsafe { acquire(device, swapchain, timeout, semaphore, fence, p_image_index) };
-        let elapsed = clock::DeviceClock::now().saturating_sub(start_ns);
-        TELEMETRY
-            .counters
-            .acquires
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if elapsed > 16_000_000 {
-            tracing::debug!(swapchain = ?swapchain, elapsed_us = elapsed / 1_000, "long acquire");
-        }
-        r
-    })
-}
-
-unsafe extern "system" fn acquire_next_image2_khr(
-    device: vk::Device,
-    p_acquire_info: *const vk::AcquireNextImageInfoKHR<'_>,
-    p_image_index: *mut u32,
-) -> vk::Result {
-    crate::catch::vk_result(|| {
-        let Some(ctx) = registry::DEVICES
-            .get(&registry::key(device))
-            .map(|r| r.clone())
-        else {
-            return vk::Result::ERROR_INITIALIZATION_FAILED;
-        };
-        let Some(acquire) = ctx.fns.acquire_next_image2_khr else {
-            return vk::Result::ERROR_INITIALIZATION_FAILED;
-        };
-        let start_ns = clock::DeviceClock::now();
-        let r = unsafe { acquire(device, p_acquire_info, p_image_index) };
-        let elapsed = clock::DeviceClock::now().saturating_sub(start_ns);
-        TELEMETRY
-            .counters
-            .acquires
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if elapsed > 16_000_000 {
-            tracing::debug!(elapsed_us = elapsed / 1_000, "long acquire2");
-        }
-        r
-    })
-}
-
-unsafe extern "system" fn destroy_swapchain_khr(
-    device: vk::Device,
-    swapchain: vk::SwapchainKHR,
-    p_allocator: *const vk::AllocationCallbacks<'_>,
-) {
-    crate::catch::vk_void(|| {
-        let Some(ctx) = registry::DEVICES
-            .get(&registry::key(device))
-            .map(|r| r.clone())
-        else {
-            return;
-        };
-        if let Some(s) = ctx.strategy.get() {
-            s.notify_destroy_swapchain(swapchain);
-        }
-        if let Some(w) = ctx.google_timing.get() {
-            w.forget_swapchain(swapchain);
-        }
-        if let Some(destroy) = ctx.fns.destroy_swapchain_khr {
-            unsafe { destroy(device, swapchain, p_allocator) };
-        }
-    })
 }
 
 // ─── Spoofing / feature exposure ───────────────────────────────────────────
@@ -1018,16 +578,11 @@ unsafe fn get_physical_device_properties2_dispatch(
         };
         // Honor caller variant; fall back to the other slot only if the
         // requested PFN wasn't loaded.
+        // Strict variant dispatch — no cross-variant fallback.
         let getp2 = if khr {
-            pd.instance
-                .fns
-                .get_physical_device_properties2_khr
-                .or(pd.instance.fns.get_physical_device_properties2)
+            pd.instance.fns.get_physical_device_properties2_khr
         } else {
-            pd.instance
-                .fns
-                .get_physical_device_properties2
-                .or(pd.instance.fns.get_physical_device_properties2_khr)
+            pd.instance.fns.get_physical_device_properties2
         };
         let Some(getp2) = getp2 else {
             return;
@@ -1080,15 +635,9 @@ unsafe fn get_physical_device_features2_dispatch(
             return;
         };
         let getf2 = if khr {
-            pd.instance
-                .fns
-                .get_physical_device_features2_khr
-                .or(pd.instance.fns.get_physical_device_features2)
+            pd.instance.fns.get_physical_device_features2_khr
         } else {
-            pd.instance
-                .fns
-                .get_physical_device_features2
-                .or(pd.instance.fns.get_physical_device_features2_khr)
+            pd.instance.fns.get_physical_device_features2
         };
         let Some(getf2) = getf2 else {
             return;
@@ -1277,148 +826,6 @@ unsafe extern "system" fn get_physical_device_surface_capabilities2_khr(
             }
         }
         r
-    })
-}
-
-// ─── NV Low-Latency2 entrypoints ───────────────────────────────────────────
-
-unsafe extern "system" fn latency_sleep_nv(
-    device: vk::Device,
-    swapchain: vk::SwapchainKHR,
-    p_sleep_info: *const vk::LatencySleepInfoNV<'_>,
-) -> vk::Result {
-    crate::catch::vk_result(|| {
-        let Some(ctx) = registry::DEVICES
-            .get(&registry::key(device))
-            .map(|r| r.clone())
-        else {
-            return vk::Result::SUCCESS;
-        };
-        if let (Some(info), Some(s)) = (
-            unsafe { p_sleep_info.as_ref() },
-            ctx.strategy.get().and_then(|s| s.as_low_latency2()),
-        ) {
-            s.notify_latency_sleep_nv(swapchain, info);
-        }
-        vk::Result::SUCCESS
-    })
-}
-
-unsafe extern "system" fn set_latency_sleep_mode_nv(
-    device: vk::Device,
-    swapchain: vk::SwapchainKHR,
-    p_sleep_mode_info: *const vk::LatencySleepModeInfoNV<'_>,
-) -> vk::Result {
-    crate::catch::vk_result(|| {
-        let Some(ctx) = registry::DEVICES
-            .get(&registry::key(device))
-            .map(|r| r.clone())
-        else {
-            return vk::Result::SUCCESS;
-        };
-        if let Some(s) = ctx.strategy.get().and_then(|s| s.as_low_latency2()) {
-            s.notify_latency_sleep_mode(swapchain, unsafe { p_sleep_mode_info.as_ref() });
-        }
-        vk::Result::SUCCESS
-    })
-}
-
-unsafe extern "system" fn set_latency_marker_nv(
-    device: vk::Device,
-    _swapchain: vk::SwapchainKHR,
-    info: *const vk::SetLatencyMarkerInfoNV<'_>,
-) {
-    crate::catch::vk_void(|| {
-        let Some(ctx) = registry::DEVICES
-            .get(&registry::key(device))
-            .map(|r| r.clone())
-        else {
-            return;
-        };
-        let Some(info) = (unsafe { info.as_ref() }) else {
-            return;
-        };
-        let Some(strategy) = ctx.strategy.get().and_then(|s| s.as_low_latency2()) else {
-            return;
-        };
-        strategy.markers().record(info.present_id, info.marker);
-    })
-}
-
-unsafe extern "system" fn get_latency_timings_nv(
-    device: vk::Device,
-    _swapchain: vk::SwapchainKHR,
-    timings: *mut vk::GetLatencyMarkerInfoNV<'_>,
-) {
-    crate::catch::vk_void(|| {
-        if timings.is_null() {
-            return;
-        }
-        let Some(ctx) = registry::DEVICES
-            .get(&registry::key(device))
-            .map(|r| r.clone())
-        else {
-            unsafe { (*timings).timing_count = 0 };
-            return;
-        };
-        match ctx.strategy.get().and_then(|s| s.as_low_latency2()) {
-            Some(strategy) => unsafe {
-                strategy.markers().fill(&mut *timings);
-            },
-            None => unsafe {
-                (*timings).timing_count = 0;
-            },
-        }
-    })
-}
-
-unsafe extern "system" fn queue_notify_out_of_band_nv(
-    queue: vk::Queue,
-    _info: *const vk::OutOfBandQueueTypeInfoNV<'_>,
-) {
-    crate::catch::vk_void(|| {
-        if let Some(qctx) = registry::QUEUES
-            .get(&registry::key(queue))
-            .map(|r| r.clone())
-            && let Some(s) = qctx.strategy.as_low_latency2()
-        {
-            s.mark_out_of_band();
-        }
-    })
-}
-
-unsafe extern "system" fn anti_lag_update_amd(
-    device: vk::Device,
-    p_data: *const amd_anti_lag::AntiLagDataAMD,
-) {
-    crate::catch::vk_void(|| {
-        let Some(ctx) = registry::DEVICES
-            .get(&registry::key(device))
-            .map(|r| r.clone())
-        else {
-            return;
-        };
-        if p_data.is_null() {
-            return;
-        }
-        // Defensive copy: read the entire AntiLagDataAMD (and its referenced
-        // AntiLagPresentationInfoAMD if any) onto the stack before doing further
-        // work, so the application can't free the memory mid-call.
-        let data = unsafe { std::ptr::read_unaligned(p_data) };
-        let presentation_copy = unsafe { data.p_presentation_info.as_ref().copied() };
-        let owned = amd_anti_lag::AntiLagDataAMD {
-            s_type: data.s_type,
-            p_next: std::ptr::null(),
-            mode: data.mode,
-            max_fps: data.max_fps,
-            p_presentation_info: presentation_copy
-                .as_ref()
-                .map_or(std::ptr::null(), |p| p as *const _),
-        };
-
-        if let Some(s) = ctx.strategy.get().and_then(|s| s.as_anti_lag()) {
-            s.notify_update(&owned);
-        }
     })
 }
 
@@ -1721,19 +1128,46 @@ static DEVICE_FUNCTIONS: Lazy<FxHashMap<&'static [u8], vk::PFN_vkVoidFunction>> 
     e!(b"vkDestroyDevice", destroy_device);
     e!(b"vkGetDeviceQueue", get_device_queue);
     e!(b"vkGetDeviceQueue2", get_device_queue2);
-    e!(b"vkQueueSubmit", queue_submit);
-    e!(b"vkQueueSubmit2", queue_submit2);
-    e!(b"vkQueueSubmit2KHR", queue_submit2_khr);
-    e!(b"vkQueuePresentKHR", queue_present_khr);
-    e!(b"vkCreateSwapchainKHR", create_swapchain_khr);
-    e!(b"vkDestroySwapchainKHR", destroy_swapchain_khr);
-    e!(b"vkAcquireNextImageKHR", acquire_next_image_khr);
-    e!(b"vkAcquireNextImage2KHR", acquire_next_image2_khr);
-    e!(b"vkAntiLagUpdateAMD", anti_lag_update_amd);
-    e!(b"vkLatencySleepNV", latency_sleep_nv);
-    e!(b"vkSetLatencySleepModeNV", set_latency_sleep_mode_nv);
-    e!(b"vkSetLatencyMarkerNV", set_latency_marker_nv);
-    e!(b"vkGetLatencyTimingsNV", get_latency_timings_nv);
-    e!(b"vkQueueNotifyOutOfBandNV", queue_notify_out_of_band_nv);
+    e!(b"vkQueueSubmit", entrypoints::queue::queue_submit);
+    e!(b"vkQueueSubmit2", entrypoints::queue::queue_submit2);
+    e!(b"vkQueueSubmit2KHR", entrypoints::queue::queue_submit2_khr);
+    e!(b"vkQueuePresentKHR", entrypoints::queue::queue_present_khr);
+    e!(
+        b"vkCreateSwapchainKHR",
+        entrypoints::swapchain::create_swapchain_khr
+    );
+    e!(
+        b"vkDestroySwapchainKHR",
+        entrypoints::swapchain::destroy_swapchain_khr
+    );
+    e!(
+        b"vkAcquireNextImageKHR",
+        entrypoints::swapchain::acquire_next_image_khr
+    );
+    e!(
+        b"vkAcquireNextImage2KHR",
+        entrypoints::swapchain::acquire_next_image2_khr
+    );
+    e!(
+        b"vkAntiLagUpdateAMD",
+        entrypoints::latency::anti_lag_update_amd
+    );
+    e!(b"vkLatencySleepNV", entrypoints::latency::latency_sleep_nv);
+    e!(
+        b"vkSetLatencySleepModeNV",
+        entrypoints::latency::set_latency_sleep_mode_nv
+    );
+    e!(
+        b"vkSetLatencyMarkerNV",
+        entrypoints::latency::set_latency_marker_nv
+    );
+    e!(
+        b"vkGetLatencyTimingsNV",
+        entrypoints::latency::get_latency_timings_nv
+    );
+    e!(
+        b"vkQueueNotifyOutOfBandNV",
+        entrypoints::latency::queue_notify_out_of_band_nv
+    );
     m
 });

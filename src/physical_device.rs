@@ -22,6 +22,23 @@ pub const OPTIONAL_EXTENSIONS: &[&CStr] = &[
     vk::GOOGLE_DISPLAY_TIMING_NAME,
 ];
 
+/// `VK_EXT_present_timing` is the Vulkan 1.4-era successor to
+/// `VK_GOOGLE_display_timing`: same idea but with a host-monotonic
+/// guarantee on the returned timestamps. ash 0.38 doesn't bind it yet, so
+/// we detect by raw extension name and only log a preference today.
+/// TODO: once ash exposes the PFNs, wire it as the preferred fallback
+/// ahead of GOOGLE_display_timing.
+pub const EXT_PRESENT_TIMING_NAME_RAW: &[u8] = b"VK_EXT_present_timing";
+
+/// Returns true if the device advertises VK_EXT_present_timing; used
+/// today only to log capability info so users know when the upgrade path
+/// becomes available.
+pub fn supports_ext_present_timing(supported_names_raw: &[Vec<u8>]) -> bool {
+    supported_names_raw
+        .iter()
+        .any(|n| n == EXT_PRESENT_TIMING_NAME_RAW)
+}
+
 pub struct PhysicalDeviceContext {
     pub instance: Arc<InstanceContext>,
     pub properties: vk::PhysicalDeviceProperties,
@@ -53,6 +70,12 @@ impl PhysicalDeviceContext {
             .copied()
             .filter(|w| available.iter().any(|h| h == w.to_bytes()))
             .collect();
+
+        if supports_ext_present_timing(&available) {
+            tracing::info!(
+                "VK_EXT_present_timing detected — not yet wired; using GOOGLE/KHR fallback"
+            );
+        }
 
         Self {
             instance,
