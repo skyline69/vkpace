@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use eframe::egui;
 
 use crate::parse::parse_line;
 use crate::state::SharedState;
@@ -21,20 +23,31 @@ const READ_TIMEOUT: Duration = Duration::from_millis(500);
 const BACKOFF_MIN: Duration = Duration::from_millis(100);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
-pub fn spawn(path: PathBuf, state: Arc<SharedState>) -> JoinHandle<()> {
+pub fn spawn(
+    path: PathBuf,
+    state: Arc<SharedState>,
+    ctx: egui::Context,
+) -> JoinHandle<()> {
     thread::Builder::new()
         .name("vkpace-hud-reader".into())
-        .spawn(move || run(path, state))
+        .spawn(move || run(path, state, ctx))
         .expect("spawn reader thread")
 }
 
-fn run(path: PathBuf, state: Arc<SharedState>) {
+/// Throttle repaint pings to ~10 Hz. Each ping wakes the UI thread to
+/// repaint; pinging on every record (~144 Hz) would defeat the point of
+/// reducing GPU contention with the game.
+const REPAINT_INTERVAL: Duration = Duration::from_millis(100);
+
+fn run(path: PathBuf, state: Arc<SharedState>, ctx: egui::Context) {
     let mut backoff = BACKOFF_MIN;
+    let mut last_repaint = Instant::now() - REPAINT_INTERVAL;
     while !state.stop.load(Ordering::Acquire) {
         let stream = match UnixStream::connect(&path) {
             Ok(s) => s,
             Err(_) => {
                 state.connected.store(false, Ordering::Release);
+                ctx.request_repaint(); // reflect disconnect immediately
                 sleep_interruptible(&state, backoff);
                 backoff = (backoff * 2).min(BACKOFF_MAX);
                 continue;
@@ -47,6 +60,7 @@ fn run(path: PathBuf, state: Arc<SharedState>) {
             continue;
         }
         state.connected.store(true, Ordering::Release);
+        ctx.request_repaint();
         backoff = BACKOFF_MIN;
 
         let mut reader = BufReader::new(stream);
@@ -61,6 +75,11 @@ fn run(path: PathBuf, state: Arc<SharedState>) {
                 Ok(_) => {
                     if let Some(rec) = parse_line(&line) {
                         state.push(rec);
+                        // Coalesce repaints so the UI doesn't run at game-fps.
+                        if last_repaint.elapsed() >= REPAINT_INTERVAL {
+                            ctx.request_repaint();
+                            last_repaint = Instant::now();
+                        }
                     }
                 }
                 Err(e) => {
@@ -76,6 +95,7 @@ fn run(path: PathBuf, state: Arc<SharedState>) {
             }
         }
         state.connected.store(false, Ordering::Release);
+        ctx.request_repaint();
     }
 }
 

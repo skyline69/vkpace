@@ -60,7 +60,11 @@ fn smooth_bound(prev: f64, target: f64, floor: f64, ceiling: f64) -> f64 {
 
 impl eframe::App for HudApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(16));
+        // Slow fallback heartbeat (4 Hz). Real refresh is reader-driven
+        // via Context::request_repaint, so the UI is responsive when data
+        // arrives without burning GPU cycles competing with the game when
+        // it doesn't.
+        ctx.request_repaint_after(Duration::from_millis(250));
 
         let connected = self.state.connected.load(Ordering::Acquire);
         let now_ns = self.state.latest_ts().unwrap_or(0);
@@ -264,11 +268,13 @@ fn plots(
                     // Use the bin's actual width — full BIN_NS for sealed
                     // bins, partial for the current one — so the rightmost
                     // bin reads true instantaneous fps instead of looking
-                    // like a frame drop.
-                    // Drop bins with too few samples to be representative,
-                    // except the current bin — there we want present-time
-                    // data even if only one record has arrived in this
-                    // half-bin.
+                    // like a frame drop. Skip the current bin until it's
+                    // wide enough (≥100 ms) to give a stable reading;
+                    // otherwise a 2-record/20-ms bin yields a 200 fps
+                    // spike that punches through fps_y_max.
+                    if b.is_current && b.width_ns < 100_000_000 {
+                        return f64::NAN;
+                    }
                     if !b.is_current && b.records.len() < 4 {
                         return f64::NAN;
                     }
@@ -359,10 +365,13 @@ fn plots(
                 // current bin reads `width_ms / count` instead of the
                 // full BIN_NS denominator.
                 let pts = stats::bin_records(snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
-                    // Drop bins with too few samples to be representative,
-                    // except the current bin — there we want present-time
-                    // data even if only one record has arrived in this
-                    // half-bin.
+                    // Same as the fps closure — skip the current bin until
+                    // it's wide enough that the partial-width reading is
+                    // stable, otherwise a 2-record/20-ms bin yields a
+                    // ~10 ms frame-time spike off the top of the plot.
+                    if b.is_current && b.width_ns < 100_000_000 {
+                        return f64::NAN;
+                    }
                     if !b.is_current && b.records.len() < 4 {
                         return f64::NAN;
                     }

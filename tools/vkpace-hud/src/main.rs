@@ -26,7 +26,6 @@ fn main() -> eframe::Result<()> {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET));
 
     let state = Arc::new(state::SharedState::new());
-    let _reader = reader::spawn(path.clone(), state.clone());
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -40,6 +39,11 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             theme::install(&cc.egui_ctx);
+            // Reader gets the egui context so it can wake the UI when new
+            // records arrive — otherwise the UI runs at a slow fallback
+            // tick to avoid contending with the game for GPU bandwidth.
+            let _reader = reader::spawn(path.clone(), state.clone(), cc.egui_ctx.clone());
+            std::mem::forget(_reader);
             Ok(Box::new(ui::HudApp::new(app_state)))
         }),
     )
