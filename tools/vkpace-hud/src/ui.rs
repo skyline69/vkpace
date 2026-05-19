@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use eframe::egui::{self, Color32, Frame, Margin, RichText, Rounding, Stroke, Vec2b};
-use egui_plot::{Legend, Line, Plot, PlotPoints};
+use egui_plot::{Legend, Line, Plot, PlotBounds, PlotPoints};
 
 use crate::state::SharedState;
 use crate::stats;
@@ -258,12 +258,16 @@ fn plots(
                     .allow_scroll(false)
                     .show_x(false)
                     .show_y(true)
-                    .auto_bounds(Vec2b::FALSE)
-                    .include_x(-60.0)
-                    .include_x(0.0)
-                    .include_y(0.0)
-                    .include_y(fps_y_max)
                     .show(inner, |plot_ui| {
+                        // Hard-pin bounds every frame. The builder-side
+                        // `include_x` gets overridden by egui_plot's
+                        // persistent bound state once the user (or auto-fit)
+                        // touches it — this is the only API that wins.
+                        plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                            [-60.0, 0.0],
+                            [0.0, fps_y_max],
+                        ));
+                        plot_ui.set_auto_bounds(Vec2b::FALSE);
                         plot_ui.line(
                             Line::new(PlotPoints::from(pts))
                                 .color(theme::LINE_FPS)
@@ -293,12 +297,12 @@ fn plots(
                     .allow_zoom(false)
                     .allow_drag(false)
                     .allow_scroll(false)
-                    .auto_bounds(Vec2b::FALSE)
-                    .include_x(-60.0)
-                    .include_x(0.0)
-                    .include_y(0.0)
-                    .include_y(latency_y_max)
                     .show(inner, |plot_ui| {
+                        plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                            [-60.0, 0.0],
+                            [0.0, latency_y_max],
+                        ));
+                        plot_ui.set_auto_bounds(Vec2b::FALSE);
                         plot_ui.line(
                             Line::new(PlotPoints::from(p50_points))
                                 .color(theme::LINE_P50)
@@ -340,12 +344,12 @@ fn plots(
                     .allow_zoom(false)
                     .allow_drag(false)
                     .allow_scroll(false)
-                    .auto_bounds(Vec2b::FALSE)
-                    .include_x(-60.0)
-                    .include_x(0.0)
-                    .include_y(0.0)
-                    .include_y(frametime_y_max)
                     .show(inner, |plot_ui| {
+                        plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                            [-60.0, 0.0],
+                            [0.0, frametime_y_max],
+                        ));
+                        plot_ui.set_auto_bounds(Vec2b::FALSE);
                         plot_ui.line(
                             Line::new(PlotPoints::from(pts))
                                 .color(theme::LINE_FRAMETIME)
