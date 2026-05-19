@@ -247,8 +247,14 @@ fn plots(
         )
         .show(ctx, |ui| {
             let total = ui.available_height();
-            // Three panels stacked; leave 8 px of breathing room between.
-            let plot_h = (total / 3.0 - 12.0).max(80.0);
+            // Each plot card has its own chrome: 8 px Frame top + 8 px
+            // bottom inner margin, 16 px title line, 2 px gap, plus a
+            // 4 px between-card spacer. Reserve all of that off the
+            // available height before splitting in thirds, otherwise the
+            // third card overflows the panel and its X-axis labels get
+            // clipped at the window edge.
+            const CARD_CHROME: f32 = 38.0;
+            let plot_h = ((total - 3.0 * CARD_CHROME) / 3.0).max(80.0);
 
             plot_card(ui, "fps", plot_h, |inner| {
                 // Same partial-bin skip as the frame-time plot — a 1-record

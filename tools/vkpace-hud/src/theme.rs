@@ -4,7 +4,14 @@
 //! collide and metric-tile chrome that gives the HUD a "tool" feel rather
 //! than "default eframe demo".
 
-use eframe::egui::{self, Color32, Rounding, Stroke};
+use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, Rounding, Stroke};
+
+/// JetBrains Mono Regular (OFL licensed; see assets/OFL.txt). Bundled
+/// because the host font set on user machines is unpredictable — running
+/// without it produces the default Ubuntu/ProggyClean pair, which is
+/// fine but doesn't match the instrument-panel aesthetic.
+const FONT_REGULAR: &[u8] = include_bytes!("../assets/JetBrainsMono-Regular.otf");
+const FONT_MEDIUM: &[u8] = include_bytes!("../assets/JetBrainsMono-Medium.otf");
 
 // ── Palette ────────────────────────────────────────────────────────────
 // Backgrounds: layered greys, slight blue tint so the HUD reads as
@@ -36,9 +43,11 @@ pub const LINE_P50: Color32 = Color32::from_rgb(120, 200, 250);
 pub const LINE_P99: Color32 = Color32::from_rgb(255, 188, 90);
 pub const LINE_MAX: Color32 = Color32::from_rgb(255, 110, 110);
 
-/// Install palette + corner-radius into the egui context. Called once at
-/// app startup; everything else picks up the colors via `style`.
+/// Install palette + fonts into the egui context. Called once at app
+/// startup; everything else picks up the colors via `style` and the font
+/// via `FontFamily::{Proportional, Monospace}`.
 pub fn install(ctx: &egui::Context) {
+    install_fonts(ctx);
     let mut visuals = egui::Visuals::dark();
     visuals.window_fill = BG_WINDOW;
     visuals.panel_fill = BG_PANEL;
@@ -75,6 +84,36 @@ pub fn install(ctx: &egui::Context) {
     // anywhere over the metrics doesn't highlight text or steal focus.
     style.interaction.selectable_labels = false;
     ctx.set_style(style);
+}
+
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    fonts
+        .font_data
+        .insert("jbmono".into(), FontData::from_static(FONT_REGULAR));
+    fonts
+        .font_data
+        .insert("jbmono-medium".into(), FontData::from_static(FONT_MEDIUM));
+    // Make our font the primary for both families. Mono everywhere fits a
+    // numeric instrument panel and keeps metric columns aligned.
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, "jbmono".into());
+    fonts
+        .families
+        .entry(FontFamily::Monospace)
+        .or_default()
+        .insert(0, "jbmono".into());
+    // Register the medium variant under a custom family so RichText::strong
+    // picks it up via style.text_styles below.
+    fonts
+        .families
+        .entry(FontFamily::Name("jbmono-medium".into()))
+        .or_default()
+        .insert(0, "jbmono-medium".into());
+    ctx.set_fonts(fonts);
 }
 
 /// Colour for an fps metric value. ≥ 120 fps green, ≥ 60 amber, lower red,
