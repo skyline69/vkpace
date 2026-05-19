@@ -9,6 +9,7 @@ mod parse;
 mod reader;
 mod state;
 mod stats;
+mod theme;
 mod ui;
 
 use std::path::PathBuf;
@@ -37,6 +38,9 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "vkpace HUD",
         options,
-        Box::new(move |_cc| Ok(Box::new(ui::HudApp::new(app_state)))),
+        Box::new(move |cc| {
+            theme::install(&cc.egui_ctx);
+            Ok(Box::new(ui::HudApp::new(app_state)))
+        }),
     )
 }
