@@ -135,28 +135,30 @@ impl eframe::App for HudApp {
 
             // Plot 3 — frame-time (ms) from present-to-present ts_ns deltas.
             // Works for every app, including ones without Reflex markers.
+            // We report the *median* delta per bin, not the mean: one
+            // scheduler hiccup (a 30 ms frame mixed in with seventy 7 ms
+            // frames) drags the mean visibly upward, but leaves the median
+            // unchanged. The median tracks the steady-state cadence — what
+            // a user actually wants to see for "is my pacing stable".
             let frametime_points =
                 stats::bin_records(&snapshot, now_ns, WINDOW_NS, BIN_NS, |bucket| {
-                    // Mean frame-time across this bucket in ms. Buckets with
-                    // <2 records have no delta to derive; report 0.
                     if bucket.len() < 2 {
                         return 0.0;
                     }
+                    let mut deltas: Vec<u64> = Vec::with_capacity(bucket.len() - 1);
                     let mut prev = bucket[0].ts_ns;
-                    let mut sum = 0u64;
-                    let mut n = 0u64;
                     for r in &bucket[1..] {
                         if r.ts_ns > prev {
-                            sum += r.ts_ns - prev;
-                            n += 1;
+                            deltas.push(r.ts_ns - prev);
                         }
                         prev = r.ts_ns;
                     }
-                    if n == 0 {
-                        0.0
-                    } else {
-                        (sum as f64 / n as f64) / 1_000_000.0
+                    if deltas.is_empty() {
+                        return 0.0;
                     }
+                    deltas.sort_unstable();
+                    let mid = deltas[deltas.len() / 2];
+                    mid as f64 / 1_000_000.0
                 });
             Plot::new("frametime_plot")
                 .height(plot_h)
