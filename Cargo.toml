@@ -1,3 +1,10 @@
+[workspace]
+members = [".", "tools/vkpace-hud"]
+# `fuzz/` carries its own cargo-fuzz-managed manifest + lockfile and would
+# otherwise drag libfuzzer-sys into every `cargo check`.
+exclude = ["fuzz"]
+resolver = "2"
+
 [package]
 name = "vkpace"
 version = "0.1.0"

@@ -27,7 +27,14 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
+      # vkpace-hud pulls in eframe (wgpu + wayland + x11), which the
+      # workspace clippy invocation now compiles. Install its native deps
+      # so clippy doesn't fail on missing -lwayland-client / -lxkbcommon.
+      - name: Install eframe native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev libgtk-3-dev
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   build:
     runs-on: ubuntu-latest
@@ -50,7 +57,11 @@ jobs:
       # build it first so the path resolution short-circuits without
       # re-invoking cargo from inside the test.
       - run: cargo build --lib
-      - run: cargo test --all-features
+      - name: Install eframe native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev libgtk-3-dev
+      - run: cargo test --workspace --all-features
 
   miri:
     runs-on: ubuntu-latest
@@ -67,6 +78,20 @@ jobs:
           cargo +nightly miri test timestamp_pool::tests
           cargo +nightly miri test config::tests
           cargo +nightly miri test delay_controller::tests
+
+  # Release build of the standalone telemetry HUD. Kept separate from the
+  # layer's `build` job so the layer build stays lean and free of GUI deps.
+  hud:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install eframe native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev libgtk-3-dev
+      - run: cargo build --release -p vkpace-hud
 
   # Real loader smoke test: load the cdylib through the Vulkan loader
   # against a Mesa software ICD (lavapipe) and run a few `vkcube`-equivalent

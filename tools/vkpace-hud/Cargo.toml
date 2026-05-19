@@ -1,0 +1,23 @@
+[package]
+name = "vkpace-hud"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Ö. Efe D. <67526259+skyline69@users.noreply.github.com>"]
+description = "Live telemetry HUD for the vkpace Vulkan layer."
+
+[[bin]]
+name = "vkpace-hud"
+path = "src/main.rs"
+
+[dependencies]
+# Default features off so we don't pull glow/persistence; wgpu is the
+# modern Vulkan-friendly path and matches the audience that runs vkpace.
+eframe = { version = "0.29", default-features = false, features = [
+    "default_fonts",
+    "wgpu",
+    "wayland",
+    "x11",
+] }
+egui_plot = "0.29"
+parking_lot = "0.12"
