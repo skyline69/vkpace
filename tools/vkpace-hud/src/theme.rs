@@ -71,6 +71,9 @@ pub fn install(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = egui::vec2(10.0, 8.0);
     style.spacing.window_margin = egui::Margin::ZERO;
+    // HUD is read-only — disable label selection globally so dragging
+    // anywhere over the metrics doesn't highlight text or steal focus.
+    style.interaction.selectable_labels = false;
     ctx.set_style(style);
 }
 
