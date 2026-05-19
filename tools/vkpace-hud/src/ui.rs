@@ -133,32 +133,20 @@ impl eframe::App for HudApp {
                 }
             });
 
-            // Plot 3 — frame-time (ms) from present-to-present ts_ns deltas.
-            // Works for every app, including ones without Reflex markers.
-            // We report the *median* delta per bin, not the mean: one
-            // scheduler hiccup (a 30 ms frame mixed in with seventy 7 ms
-            // frames) drags the mean visibly upward, but leaves the median
-            // unchanged. The median tracks the steady-state cadence — what
-            // a user actually wants to see for "is my pacing stable".
+            // Plot 3 — frame-time (ms) derived as `bin_seconds / frames`
+            // (i.e. exactly `1000 / fps_in_this_bin`). Mirrors the fps plot's
+            // smoothness by construction. We deliberately don't use per-frame
+            // ts_ns deltas: even the *median* delta in a bin moves when a
+            // single frame lands a few-hundred-µs early or late, and that
+            // sub-ms noise dominates the plot visually. The inverse-fps view
+            // tracks steady-state cadence — what a user actually watches for
+            // when tuning pacing — and the fps plot above already shows the
+            // headline number.
             let frametime_points =
-                stats::bin_records(&snapshot, now_ns, WINDOW_NS, BIN_NS, |bucket| {
-                    if bucket.len() < 2 {
-                        return 0.0;
-                    }
-                    let mut deltas: Vec<u64> = Vec::with_capacity(bucket.len() - 1);
-                    let mut prev = bucket[0].ts_ns;
-                    for r in &bucket[1..] {
-                        if r.ts_ns > prev {
-                            deltas.push(r.ts_ns - prev);
-                        }
-                        prev = r.ts_ns;
-                    }
-                    if deltas.is_empty() {
-                        return 0.0;
-                    }
-                    deltas.sort_unstable();
-                    let mid = deltas[deltas.len() / 2];
-                    mid as f64 / 1_000_000.0
+                stats::bin_records(&snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
+                    // `bin_records` already filters empty buckets, so `b.len() >= 1`.
+                    let secs_per_bin = BIN_NS as f64 / 1e9;
+                    secs_per_bin * 1000.0 / b.len() as f64
                 });
             Plot::new("frametime_plot")
                 .height(plot_h)
