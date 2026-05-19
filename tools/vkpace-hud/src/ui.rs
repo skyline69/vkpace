@@ -247,13 +247,13 @@ fn plots(
         )
         .show(ctx, |ui| {
             let total = ui.available_height();
-            // Each plot card has its own chrome: 8 px Frame top + 8 px
-            // bottom inner margin, 16 px title line, 2 px gap, plus a
-            // 4 px between-card spacer. Reserve all of that off the
-            // available height before splitting in thirds, otherwise the
-            // third card overflows the panel and its X-axis labels get
-            // clipped at the window edge.
-            const CARD_CHROME: f32 = 38.0;
+            // Per-card chrome bumped to 52 — the previous 38 covered the
+            // Frame margins + title + spacer but didn't leave any room for
+            // the plot's bottom X-axis labels, so the last card's labels
+            // got clipped by the window edge. The plot itself now reserves
+            // an extra ~12 px at the bottom via its inner ui margin
+            // (`PLOT_BODY_MARGIN`).
+            const CARD_CHROME: f32 = 52.0;
             let plot_h = ((total - 3.0 * CARD_CHROME) / 3.0).max(80.0);
 
             plot_card(ui, "fps", plot_h, |inner| {
@@ -387,7 +387,15 @@ fn plot_card(ui: &mut egui::Ui, title: &str, h: f32, body: impl FnOnce(&mut egui
         .fill(theme::BG_PANEL)
         .rounding(Rounding::same(8.0))
         .stroke(Stroke::new(1.0, theme::SEPARATOR))
-        .inner_margin(Margin::symmetric(10.0, 8.0))
+        // Extra bottom padding so the plot's own X-axis labels never crash
+        // into the card's bottom edge; extra left padding so the leftmost
+        // Y-axis number ("0", "-60") doesn't collide with the X "-60".
+        .inner_margin(Margin {
+            left: 14.0,
+            right: 10.0,
+            top: 8.0,
+            bottom: 14.0,
+        })
         .show(ui, |ui| {
             ui.set_height(h);
             ns_label(
@@ -400,7 +408,7 @@ fn plot_card(ui: &mut egui::Ui, title: &str, h: f32, body: impl FnOnce(&mut egui
             ui.add_space(2.0);
             body(ui);
         });
-    ui.add_space(4.0);
+    ui.add_space(6.0);
 }
 
 fn no_latency_hint(ui: &mut egui::Ui) {
@@ -414,12 +422,13 @@ fn no_latency_hint(ui: &mut egui::Ui) {
                 .size(13.0)
                 .strong(),
         );
+        // No italic — we only ship the upright JetBrains Mono cuts, and
+        // egui synthesises italic via shear which looks bad on mono.
         ns_label(
             ui,
             RichText::new("app is not calling vkSetLatencyMarkerNV (Reflex)")
                 .color(theme::FG_WEAK)
-                .size(11.0)
-                .italics(),
+                .size(11.0),
         );
     });
 }
