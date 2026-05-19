@@ -12,9 +12,13 @@ use crate::stats;
 
 /// Time window plotted on the X axis (60 s rolling history).
 const WINDOW_NS: u64 = 60_000_000_000;
-/// Plot bin width — 100 ms per point keeps the line smooth without
-/// drowning the renderer in geometry.
-const BIN_NS: u64 = 100_000_000;
+/// Plot bin width. 100 ms bins at 144 fps held only ~14 samples each, so
+/// boundary alignment alone produced ±10% reading swings (visible as the
+/// noisy zig-zag in the first live capture). 500 ms gives ~70 samples per
+/// bin at 144 fps — stable to within ~1 sample of ground truth — and 120
+/// points across the 60 s window, which is plenty of horizontal
+/// resolution at typical HUD sizes.
+const BIN_NS: u64 = 500_000_000;
 /// Live-stats window for the top-strip numbers.
 const STATS_WINDOW_NS: u64 = 1_000_000_000;
 
@@ -72,13 +76,10 @@ impl eframe::App for HudApp {
             let total = ui.available_height();
             let plot_h = (total / 3.0 - 8.0).max(80.0);
 
-            // Plot 1 — fps over time.
+            // Plot 1 — fps over time. `bin_records` already drops empties,
+            // so this never sees a zero-length bucket.
             let fps_points = stats::bin_records(&snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
-                if b.is_empty() {
-                    0.0
-                } else {
-                    b.len() as f64 * 1_000_000_000.0 / BIN_NS as f64
-                }
+                b.len() as f64 * 1_000_000_000.0 / BIN_NS as f64
             });
             Plot::new("fps_plot")
                 .height(plot_h)

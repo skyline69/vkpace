@@ -62,6 +62,12 @@ pub fn live_stats(records: &[Record], now_ns: u64, window_ns: u64) -> LiveStats 
 /// Bin records into `bin_ns` buckets relative to `now_ns - window_ns`.
 /// Returns `(t_seconds_offset, value)` pairs suitable for plotting; the
 /// `value` is the per-bin aggregate produced by `agg`.
+///
+/// **Empty bins are skipped.** Emitting `0.0` for them yanks the line
+/// down to zero between samples and looks like a frame-drop spike when
+/// the actual cause is just a bin offset that fell between two records.
+/// Skipping leaves a gap in the line, which `egui_plot` renders as a
+/// continuous segment across the missing point — visually correct.
 pub fn bin_records<F>(
     records: &[Record],
     now_ns: u64,
@@ -90,6 +96,7 @@ where
     buckets
         .into_iter()
         .enumerate()
+        .filter(|(_, b)| !b.is_empty())
         .map(|(i, bucket)| {
             // X axis in seconds, relative to `now`. Bin 0 is the oldest in
             // the window, bin (n-1) is the newest, so subtract from window.
@@ -180,6 +187,23 @@ mod tests {
         ];
         let gaps = frame_gaps(&records);
         assert_eq!(gaps, vec![[6.0, 3.0], [10.0, 2.0]]);
+    }
+
+    #[test]
+    fn bin_records_skips_empty_bins() {
+        // Sparse: 3 records across a 1s/100ms-bins window → only 3 entries,
+        // not 10. Regression check for the "line snaps to zero between
+        // samples" jitter we hit in the first live capture.
+        let records = vec![
+            rec(100_000_000, 1, 0),
+            rec(500_000_000, 2, 0),
+            rec(900_000_000, 3, 0),
+        ];
+        let bins = bin_records(&records, 1_000_000_000, 1_000_000_000, 100_000_000, |b| {
+            b.len() as f64
+        });
+        assert_eq!(bins.len(), 3);
+        assert!(bins.iter().all(|p| (p[1] - 1.0).abs() < f64::EPSILON));
     }
 
     #[test]
