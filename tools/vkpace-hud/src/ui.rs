@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use eframe::egui::{self, Color32, Frame, Margin, RichText, Rounding, Stroke};
+use eframe::egui::{self, Color32, Frame, Margin, RichText, Rounding, Stroke, Vec2b};
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 
 use crate::state::SharedState;
@@ -20,12 +20,33 @@ const STATS_WINDOW_NS: u64 = 1_000_000_000;
 
 pub struct HudApp {
     state: Arc<SharedState>,
+    /// Smoothed Y-axis upper bounds. egui_plot auto-fits per-frame, which
+    /// makes the line appear to jump as bounds tighten/loosen with each
+    /// new sample. We compute our own bounds, EMA-smooth them, then pin
+    /// the plot to `[0, smoothed_max]`, so motion only comes from the
+    /// data itself.
+    fps_y_max: f64,
+    frametime_y_max: f64,
+    latency_y_max: f64,
 }
 
 impl HudApp {
     pub fn new(state: Arc<SharedState>) -> Self {
-        Self { state }
+        Self {
+            state,
+            fps_y_max: 160.0,
+            frametime_y_max: 33.0,
+            latency_y_max: 30_000.0,
+        }
     }
+}
+
+/// EMA-smooth `prev` toward `target`, clamped to `[floor, ceiling]`. Slow
+/// alpha so the axis doesn't wobble even when the underlying max shifts.
+fn smooth_bound(prev: f64, target: f64, floor: f64, ceiling: f64) -> f64 {
+    let alpha = 0.05;
+    let next = prev * (1.0 - alpha) + target * alpha;
+    next.clamp(floor, ceiling)
 }
 
 impl eframe::App for HudApp {
@@ -46,7 +67,32 @@ impl eframe::App for HudApp {
             .sum();
 
         top_strip(ctx, connected, &live, drops);
-        plots(ctx, &snapshot, now_ns, live.samples);
+
+        // Update smoothed Y bounds from the visible snapshot. Targets are
+        // computed once per frame so the plot's `.include_y(...)` reads a
+        // stable value during render.
+        let fps_target = (live.fps * 1.25).max(160.0);
+        let frametime_target = (live
+            .fps
+            .max(30.0)
+            .recip()
+            * 1000.0
+            * 2.0)
+            .max(20.0);
+        let latency_target = ((live.max_us as f64) * 1.4).max(8_000.0);
+        self.fps_y_max = smooth_bound(self.fps_y_max, fps_target, 60.0, 600.0);
+        self.frametime_y_max = smooth_bound(self.frametime_y_max, frametime_target, 16.0, 200.0);
+        self.latency_y_max = smooth_bound(self.latency_y_max, latency_target, 8_000.0, 200_000.0);
+
+        plots(
+            ctx,
+            &snapshot,
+            now_ns,
+            live.samples,
+            self.fps_y_max,
+            self.frametime_y_max,
+            self.latency_y_max,
+        );
     }
 
     fn on_exit(&mut self) {
@@ -173,7 +219,15 @@ fn connection_pill(ui: &mut egui::Ui, connected: bool) {
 
 // ── Plots ─────────────────────────────────────────────────────────────
 
-fn plots(ctx: &egui::Context, snapshot: &[crate::state::Record], now_ns: u64, samples: usize) {
+fn plots(
+    ctx: &egui::Context,
+    snapshot: &[crate::state::Record],
+    now_ns: u64,
+    samples: usize,
+    fps_y_max: f64,
+    frametime_y_max: f64,
+    latency_y_max: f64,
+) {
     egui::CentralPanel::default()
         .frame(
             Frame::none()
@@ -186,9 +240,16 @@ fn plots(ctx: &egui::Context, snapshot: &[crate::state::Record], now_ns: u64, sa
             let plot_h = (total / 3.0 - 12.0).max(80.0);
 
             plot_card(ui, "fps", plot_h, |inner| {
+                // Same partial-bin skip as the frame-time plot — a 1-record
+                // bin reports `10 fps` which looks like an enormous drop on
+                // the first plotted point.
                 let pts = stats::bin_records(snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
+                    if b.len() < 8 {
+                        return f64::NAN;
+                    }
                     b.len() as f64 * 1_000_000_000.0 / BIN_NS as f64
                 });
+                let pts: Vec<[f64; 2]> = pts.into_iter().filter(|p| p[1].is_finite()).collect();
                 Plot::new("fps_plot")
                     .height(inner.available_height())
                     .legend(Legend::default().background_alpha(0.0))
@@ -197,6 +258,11 @@ fn plots(ctx: &egui::Context, snapshot: &[crate::state::Record], now_ns: u64, sa
                     .allow_scroll(false)
                     .show_x(false)
                     .show_y(true)
+                    .auto_bounds(Vec2b::FALSE)
+                    .include_x(-60.0)
+                    .include_x(0.0)
+                    .include_y(0.0)
+                    .include_y(fps_y_max)
                     .show(inner, |plot_ui| {
                         plot_ui.line(
                             Line::new(PlotPoints::from(pts))
@@ -227,6 +293,11 @@ fn plots(ctx: &egui::Context, snapshot: &[crate::state::Record], now_ns: u64, sa
                     .allow_zoom(false)
                     .allow_drag(false)
                     .allow_scroll(false)
+                    .auto_bounds(Vec2b::FALSE)
+                    .include_x(-60.0)
+                    .include_x(0.0)
+                    .include_y(0.0)
+                    .include_y(latency_y_max)
                     .show(inner, |plot_ui| {
                         plot_ui.line(
                             Line::new(PlotPoints::from(p50_points))
@@ -250,16 +321,30 @@ fn plots(ctx: &egui::Context, snapshot: &[crate::state::Record], now_ns: u64, sa
             });
 
             plot_card(ui, "frame-time (ms)", plot_h, |inner| {
+                // Skip partial bins (typically the first one after socket
+                // connect): a bin with only a handful of records at startup
+                // gives `BIN_MS / count` = a hugely inflated frame-time
+                // value that drags the Y axis up and looks like a spike.
+                // Require at least 8 records before we trust the average.
                 let pts = stats::bin_records(snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
+                    if b.len() < 8 {
+                        return f64::NAN;
+                    }
                     let secs_per_bin = BIN_NS as f64 / 1e9;
                     secs_per_bin * 1000.0 / b.len() as f64
                 });
+                let pts: Vec<[f64; 2]> = pts.into_iter().filter(|p| p[1].is_finite()).collect();
                 Plot::new("frametime_plot")
                     .height(inner.available_height())
                     .legend(Legend::default().background_alpha(0.0))
                     .allow_zoom(false)
                     .allow_drag(false)
                     .allow_scroll(false)
+                    .auto_bounds(Vec2b::FALSE)
+                    .include_x(-60.0)
+                    .include_x(0.0)
+                    .include_y(0.0)
+                    .include_y(frametime_y_max)
                     .show(inner, |plot_ui| {
                         plot_ui.line(
                             Line::new(PlotPoints::from(pts))
