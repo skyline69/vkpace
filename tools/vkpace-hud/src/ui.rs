@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use eframe::egui;
-use egui_plot::{Bar, BarChart, Legend, Line, Plot, PlotPoints};
+use egui_plot::{Legend, Line, Plot, PlotPoints};
 
 use crate::state::SharedState;
 use crate::stats;
@@ -42,6 +42,12 @@ impl eframe::App for HudApp {
         };
         let live = stats::live_stats(&snapshot, now_ns, STATS_WINDOW_NS);
 
+        // Drop count over the whole 60 s plotted window (cheap; ≤ 4096 records).
+        let drops: u64 = stats::frame_gaps(&snapshot)
+            .iter()
+            .map(|p| p[1] as u64)
+            .sum();
+
         egui::TopBottomPanel::top("nums")
             .min_height(64.0)
             .show(ctx, |ui| {
@@ -55,7 +61,9 @@ impl eframe::App for HudApp {
                     big_metric(ui, "max", us_label(live.max_us));
                     ui.separator();
                     big_metric(ui, "samples", live.samples.to_string());
-                    ui.add_space(ui.available_width() - 120.0);
+                    ui.separator();
+                    big_metric(ui, "drops/60s", drops.to_string());
+                    ui.add_space(ui.available_width() - 130.0);
                     connection_pill(ui, connected);
                 });
             });
@@ -82,38 +90,82 @@ impl eframe::App for HudApp {
                 });
 
             // Plot 2 — latency p50 / p99 / max over time.
-            let p50_points = stats::bin_records(&snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
-                bin_percentile(b, 0.50)
+            // Empty when the app doesn't call vkSetLatencyMarkerNV (vkcube,
+            // most demo apps). Replace with a hint so the user knows it's
+            // not broken — only Reflex-aware apps emit input markers.
+            ui.vertical(|ui| {
+                ui.set_height(plot_h);
+                if live.samples == 0 {
+                    ui.add_space(plot_h / 2.0 - 8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "no latency samples — app is not emitting Reflex \
+                             markers (vkSetLatencyMarkerNV). Frame-time plot \
+                             below works regardless.",
+                        )
+                        .italics()
+                        .weak(),
+                    );
+                } else {
+                    let p50_points =
+                        stats::bin_records(&snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
+                            bin_percentile(b, 0.50)
+                        });
+                    let p99_points =
+                        stats::bin_records(&snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
+                            bin_percentile(b, 0.99)
+                        });
+                    let max_points =
+                        stats::bin_records(&snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
+                            b.iter().map(|r| r.latency_us as f64).fold(0.0, f64::max)
+                        });
+                    Plot::new("latency_plot")
+                        .height(plot_h)
+                        .legend(Legend::default())
+                        .allow_zoom(false)
+                        .allow_drag(false)
+                        .show(ui, |plot_ui| {
+                            plot_ui.line(Line::new(PlotPoints::from(p50_points)).name("p50 µs"));
+                            plot_ui.line(Line::new(PlotPoints::from(p99_points)).name("p99 µs"));
+                            plot_ui.line(Line::new(PlotPoints::from(max_points)).name("max µs"));
+                        });
+                }
             });
-            let p99_points = stats::bin_records(&snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
-                bin_percentile(b, 0.99)
-            });
-            let max_points = stats::bin_records(&snapshot, now_ns, WINDOW_NS, BIN_NS, |b| {
-                b.iter().map(|r| r.latency_us as f64).fold(0.0, f64::max)
-            });
-            Plot::new("latency_plot")
-                .height(plot_h)
-                .legend(Legend::default())
-                .allow_zoom(false)
-                .allow_drag(false)
-                .show(ui, |plot_ui| {
-                    plot_ui.line(Line::new(PlotPoints::from(p50_points)).name("p50 µs"));
-                    plot_ui.line(Line::new(PlotPoints::from(p99_points)).name("p99 µs"));
-                    plot_ui.line(Line::new(PlotPoints::from(max_points)).name("max µs"));
-                });
 
-            // Plot 3 — frame-index gaps as a bar chart.
-            let bars: Vec<Bar> = stats::frame_gaps(&snapshot)
-                .into_iter()
-                .map(|p| Bar::new(p[0], p[1]).width(1.0))
-                .collect();
-            Plot::new("gaps_plot")
+            // Plot 3 — frame-time (ms) from present-to-present ts_ns deltas.
+            // Works for every app, including ones without Reflex markers.
+            let frametime_points =
+                stats::bin_records(&snapshot, now_ns, WINDOW_NS, BIN_NS, |bucket| {
+                    // Mean frame-time across this bucket in ms. Buckets with
+                    // <2 records have no delta to derive; report 0.
+                    if bucket.len() < 2 {
+                        return 0.0;
+                    }
+                    let mut prev = bucket[0].ts_ns;
+                    let mut sum = 0u64;
+                    let mut n = 0u64;
+                    for r in &bucket[1..] {
+                        if r.ts_ns > prev {
+                            sum += r.ts_ns - prev;
+                            n += 1;
+                        }
+                        prev = r.ts_ns;
+                    }
+                    if n == 0 {
+                        0.0
+                    } else {
+                        (sum as f64 / n as f64) / 1_000_000.0
+                    }
+                });
+            Plot::new("frametime_plot")
                 .height(plot_h)
                 .legend(Legend::default())
                 .allow_zoom(false)
                 .allow_drag(false)
                 .show(ui, |plot_ui| {
-                    plot_ui.bar_chart(BarChart::new(bars).name("dropped"));
+                    plot_ui.line(
+                        Line::new(PlotPoints::from(frametime_points)).name("frame-time ms"),
+                    );
                 });
         });
     }
@@ -132,11 +184,17 @@ fn big_metric(ui: &mut egui::Ui, label: &str, value: String) {
 
 fn connection_pill(ui: &mut egui::Ui, connected: bool) {
     let (text, color) = if connected {
-        ("● connected", egui::Color32::from_rgb(96, 200, 96))
+        ("connected", egui::Color32::from_rgb(96, 200, 96))
     } else {
-        ("● disconnected", egui::Color32::from_rgb(200, 96, 96))
+        ("disconnected", egui::Color32::from_rgb(200, 96, 96))
     };
-    ui.label(egui::RichText::new(text).color(color).size(13.0));
+    ui.horizontal(|ui| {
+        // Paint a solid dot via the painter — default eframe fonts don't
+        // ship `●` (U+25CF), so a glyph would render as the .notdef box.
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 5.0, color);
+        ui.label(egui::RichText::new(text).color(color).size(13.0));
+    });
 }
 
 fn us_label(us: u64) -> String {
