@@ -4,7 +4,16 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use eframe::egui::{self, Color32, Frame, Margin, RichText, Rounding, Stroke, Vec2b};
+use eframe::egui::{self, Color32, Frame, Label, Margin, RichText, Rounding, Stroke, Vec2b};
+
+/// Drop-in for `ui.label(text)` that never lets the user select the
+/// glyphs. We belt-and-suspender the global
+/// `style.interaction.selectable_labels = false` because the style flag
+/// has been seen to get re-enabled on the first paint depending on the
+/// backend; per-widget `.selectable(false)` is the authoritative override.
+fn ns_label(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
+    ui.add(Label::new(text).selectable(false));
+}
 use egui_plot::{Legend, Line, Plot, PlotBounds, PlotPoints};
 
 use crate::state::SharedState;
@@ -172,13 +181,15 @@ fn metric_tile(ui: &mut egui::Ui, label: &str, value: String, value_color: Color
         .inner_margin(Margin::symmetric(12.0, 8.0))
         .show(ui, |ui| {
             ui.vertical(|ui| {
-                ui.label(
+                ns_label(
+                    ui,
                     RichText::new(value)
                         .size(24.0)
                         .color(value_color)
                         .strong(),
                 );
-                ui.label(
+                ns_label(
+                    ui,
                     RichText::new(label)
                         .size(10.0)
                         .color(theme::FG_WEAK)
@@ -212,7 +223,7 @@ fn connection_pill(ui: &mut egui::Ui, connected: bool) {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                 ui.painter().circle_filled(rect.center(), 4.0, color);
-                ui.label(RichText::new(text).color(color).size(12.0).strong());
+                ns_label(ui, RichText::new(text).color(color).size(12.0).strong());
             });
         });
 }
@@ -297,6 +308,8 @@ fn plots(
                     .allow_zoom(false)
                     .allow_drag(false)
                     .allow_scroll(false)
+                    .allow_boxed_zoom(false)
+                    .auto_bounds(Vec2b::FALSE)
                     .show(inner, |plot_ui| {
                         plot_ui.set_plot_bounds(PlotBounds::from_min_max(
                             [-60.0, 0.0],
@@ -344,6 +357,8 @@ fn plots(
                     .allow_zoom(false)
                     .allow_drag(false)
                     .allow_scroll(false)
+                    .allow_boxed_zoom(false)
+                    .auto_bounds(Vec2b::FALSE)
                     .show(inner, |plot_ui| {
                         plot_ui.set_plot_bounds(PlotBounds::from_min_max(
                             [-60.0, 0.0],
@@ -369,7 +384,8 @@ fn plot_card(ui: &mut egui::Ui, title: &str, h: f32, body: impl FnOnce(&mut egui
         .inner_margin(Margin::symmetric(10.0, 8.0))
         .show(ui, |ui| {
             ui.set_height(h);
-            ui.label(
+            ns_label(
+                ui,
                 RichText::new(title)
                     .color(theme::FG_WEAK)
                     .size(11.0)
@@ -385,13 +401,15 @@ fn no_latency_hint(ui: &mut egui::Ui) {
     let h = ui.available_height();
     ui.vertical_centered(|ui| {
         ui.add_space((h / 2.0 - 10.0).max(0.0));
-        ui.label(
+        ns_label(
+            ui,
             RichText::new("no latency samples")
                 .color(theme::FG_NORMAL)
                 .size(13.0)
                 .strong(),
         );
-        ui.label(
+        ns_label(
+            ui,
             RichText::new("app is not calling vkSetLatencyMarkerNV (Reflex)")
                 .color(theme::FG_WEAK)
                 .size(11.0)
